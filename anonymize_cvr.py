@@ -49,6 +49,8 @@ def aggregate_votes(
     headerlen: int = 8,
     aggregate_id: str = "",
     ballot_type_idx: Optional[int] = None,
+    precinct_portion_idx: Optional[int] = None,
+    counting_group_idx: Optional[int] = None,
 ) -> List[str]:
     """
     Aggregate multiple CVR rows into a single aggregated row.
@@ -87,20 +89,18 @@ def aggregate_votes(
     if len(aggregated) > 4:
         aggregated[4] = ""  # ImprintedId
 
-    # CountingGroup (index 5) - blank to avoid revealing additional information
-    if len(aggregated) > 5:
-        aggregated[5] = ""
+    # CountingGroup - blank to avoid revealing additional information
+    if counting_group_idx is not None and len(aggregated) > counting_group_idx:
+        aggregated[counting_group_idx] = ""
 
-    # PrecinctPortion (index 6) - blank to avoid revealing geographic/precinct information
-    if len(aggregated) > 6:
-        aggregated[6] = ""
+    # PrecinctPortion - blank to avoid revealing geographic/precinct information
+    if precinct_portion_idx is not None and len(aggregated) > precinct_portion_idx:
+        aggregated[precinct_portion_idx] = ""
 
     # BallotType - set to "AGGREGATED" for aggregated rows (if column exists)
     if ballot_type_idx is not None:
         if len(aggregated) > ballot_type_idx:
             aggregated[ballot_type_idx] = "AGGREGATED"
-    elif len(aggregated) > 7:
-        aggregated[7] = "AGGREGATED"
 
     # Aggregate vote columns (sum numeric values)
     num_cols = max(len(row) for row in rows)
@@ -868,14 +868,23 @@ def analyze_styles(
 
     # Build mapping from CVR style to descriptive style
     cvr_to_descriptive: Dict[str, str] = {}
+    cvr_to_ballot_type: Dict[str, set] = defaultdict(set)
     for cvr_style, rows in cvr_style_to_rows.items():
         if rows:
             pattern = compute_contest_pattern(rows[0], contests, headerlen)
             cvr_to_descriptive[cvr_style] = pattern_to_descriptive[pattern]
+            # Track BallotType values for this CVR style
+            if ballot_type_idx is not None:
+                for row in rows:
+                    if len(row) > ballot_type_idx:
+                        ballot_type = row[ballot_type_idx].strip()
+                        if ballot_type:
+                            cvr_to_ballot_type[cvr_style].add(ballot_type)
 
     result = {
         "pattern_to_descriptive": pattern_to_descriptive,
         "cvr_to_descriptive": cvr_to_descriptive,
+        "cvr_to_ballot_type": dict(cvr_to_ballot_type),
         "leakage_warnings": leakage_warnings,
         "pattern_to_rows": pattern_to_rows,
     }
@@ -1023,6 +1032,8 @@ def anonymize_cvr(
         print("Converting Parquet file to CSV format...", file=sys.stderr)
 
     ballot_type_idx: Optional[int] = None
+    precinct_portion_idx: Optional[int] = None
+    counting_group_idx: Optional[int] = None
 
     with TempCVRFile(input_file) as csv_file:
         # Detect line terminator from input file
@@ -1047,7 +1058,10 @@ def anonymize_cvr(
             for idx, header_name in enumerate(headers):
                 if header_name.strip().lower() == "ballottype":
                     ballot_type_idx = idx
-                    break
+                elif header_name.strip().lower() == "precinctportion":
+                    precinct_portion_idx = idx
+                elif header_name.strip().lower() == "countinggroup":
+                    counting_group_idx = idx
 
             # Read all data rows
             all_rows = list(reader)
@@ -1083,11 +1097,19 @@ def anonymize_cvr(
     # Print style mapping
     if style_analysis["cvr_to_descriptive"]:
         print("\nStyle mapping (CVR style -> Descriptive style):")
+        cvr_to_ballot_type = style_analysis.get("cvr_to_ballot_type", {})
         for cvr_style in sorted(style_analysis["cvr_to_descriptive"].keys()):
             descriptive = style_analysis["cvr_to_descriptive"][cvr_style]
             count = style_counts.get(cvr_style, 0)
             ballot_label = "ballots" if count != 1 else "ballot"
-            print(f"  {cvr_style} ({count} {ballot_label}) -> {descriptive}")
+            ballot_type_info = ""
+            if cvr_style in cvr_to_ballot_type:
+                ballot_types = sorted(cvr_to_ballot_type[cvr_style])
+                if len(ballot_types) == 1:
+                    ballot_type_info = f", BallotType={ballot_types[0]}"
+                else:
+                    ballot_type_info = f", BallotType={','.join(ballot_types)}"
+            print(f"  {cvr_style} ({count} {ballot_label}{ballot_type_info}) -> {descriptive}")
 
     # Print summary if requested
     if summarize and "summary" in style_analysis:
@@ -1139,16 +1161,25 @@ def anonymize_cvr(
             rare_styles[style_sig] = rows
             stats["rare_styles"] += len(rows)
             style_name_counts: Dict[str, int] = defaultdict(int)
+            style_ballot_types: Dict[str, set] = defaultdict(set)
             for row in rows:
+                style_value = None
                 if len(row) > stylecol:
                     style_value = row[stylecol].strip()
                     if style_value:
                         style_name_counts[style_value] += 1
+                if ballot_type_idx is not None and len(row) > ballot_type_idx:
+                    ballot_type = row[ballot_type_idx].strip()
+                    if ballot_type and style_value:
+                        style_ballot_types[style_value].add(ballot_type)
             stats["rare_style_counts"].append(
                 {
                     "descriptive_name": descriptive_name,
                     "ballot_count": len(rows),
                     "original_styles": sorted(style_name_counts.items()),
+                    "ballot_types": {
+                        style: sorted(types) for style, types in style_ballot_types.items()
+                    },
                 }
             )
         else:
@@ -1178,6 +1209,8 @@ def anonymize_cvr(
                 headerlen,
                 aggregate_id="TEMP",
                 ballot_type_idx=ballot_type_idx,
+                precinct_portion_idx=precinct_portion_idx,
+                counting_group_idx=counting_group_idx,
             )
             stats["totals_after_rare_styles"] = tally_aggregated_votes_by_contest(
                 temp_agg_after_rare, contests, choices, headerlen
@@ -1403,6 +1436,8 @@ def anonymize_cvr(
             headerlen,
             aggregate_id="TEMP",
             ballot_type_idx=ballot_type_idx,
+            precinct_portion_idx=precinct_portion_idx,
+            counting_group_idx=counting_group_idx,
         )
         contest_totals = tally_aggregated_votes_by_contest(
             temp_aggregated, contests, choices, headerlen
@@ -1481,6 +1516,8 @@ def anonymize_cvr(
             headerlen,
             aggregate_id=agg_id,
             ballot_type_idx=ballot_type_idx,
+            precinct_portion_idx=precinct_portion_idx,
+            counting_group_idx=counting_group_idx,
         )
         # Note: CountingGroup and PrecinctPortion are already blanked in aggregate_votes
         # BallotType is set to "AGGREGATED" for aggregated rows
@@ -1520,13 +1557,13 @@ def anonymize_cvr(
             if cvr_num not in aggregated_cvr_numbers:
                 # Create a copy to avoid modifying the original
                 output_row = row.copy()
-                # Blank CountingGroup (index 5) and PrecinctPortion (index 6)
-                # Preserve BallotType (index 7) - it should only reflect contest pattern
-                if len(output_row) > 5:
-                    output_row[5] = ""  # CountingGroup
-                if len(output_row) > 6:
-                    output_row[6] = ""  # PrecinctPortion
-                # BallotType (index 7) is preserved as-is
+                # Blank CountingGroup and PrecinctPortion if they exist
+                # Preserve BallotType - it should only reflect contest pattern
+                if counting_group_idx is not None and len(output_row) > counting_group_idx:
+                    output_row[counting_group_idx] = ""  # CountingGroup
+                if precinct_portion_idx is not None and len(output_row) > precinct_portion_idx:
+                    output_row[precinct_portion_idx] = ""  # PrecinctPortion
+                # BallotType is preserved as-is (not blanked for non-aggregated rows)
                 output_rows.append(output_row)
 
     # Add aggregated rows
@@ -1647,8 +1684,17 @@ Examples:
                     orig_desc = ", ".join(f"{name} ({count})" for name, count in orig_styles)
                 else:
                     orig_desc = "unknown CVR style(s)"
+                ballot_types_info = entry.get("ballot_types", {})
+                ballot_type_str = ""
+                if ballot_types_info:
+                    # Collect all unique BallotType values across styles
+                    all_ballot_types = set()
+                    for types in ballot_types_info.values():
+                        all_ballot_types.update(types)
+                    if all_ballot_types:
+                        ballot_type_str = f", BallotType={','.join(sorted(all_ballot_types))}"
                 print(
-                    f"    {entry['descriptive_name']}: {entry['ballot_count']} ballot(s) from {orig_desc}"
+                    f"    {entry['descriptive_name']}: {entry['ballot_count']} ballot(s) from {orig_desc}{ballot_type_str}"
                 )
         print(f"  Aggregated rows created: {stats['aggregated_rows']}")
         print(f"  Final styles: {stats['final_styles']}")

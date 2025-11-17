@@ -42,17 +42,18 @@ python3 anonymize_cvr.py input.csv output.csv --summarize
 - Combines all rare styles (< 10 ballots) into a single aggregation
 - Ensures at least 10 ballots per contest in the aggregation
 - Adds contrasting votes to prevent unanimous/near-unanimous patterns
-- **Anonymizes identifying fields**: CountingGroup and PrecinctPortion are blanked in all output rows to prevent revealing geographic or voting method information beyond the contest bitmap
-- **Preserves BallotType**: BallotType is preserved in non-aggregated rows (set to "AGGREGATED" in aggregated rows). The tool warns if BallotType varies for ballots with the same contest pattern, which could indicate information leakage
+- **Anonymizes identifying fields**: CountingGroup and PrecinctPortion are dynamically detected from headers and blanked in all output rows to prevent revealing geographic or voting method information beyond the contest bitmap
+- **Preserves BallotType**: BallotType is preserved in non-aggregated rows (set to "AGGREGATED" in aggregated rows). The tool warns if BallotType varies for ballots with the same contest pattern, which could indicate information leakage. BallotType values are displayed in the style mapping output
 - Computes descriptive style names based on contest patterns
 - Detects information leakage when different CVR style names map to the same contest pattern
 - Automatic tally verification ensures vote totals match between original and anonymized CVR
 - Comprehensive aggregation statistics showing:
-  - Totals after including all rare styles
-  - Contests needing additional ballots
+  - Totals after including all rare styles (with ballot counts, vote counts, and undervotes)
+  - Contests needing additional ballots (with reasons: had X, needed Y more to reach Z)
   - Contests needing balancing (unanimous/near-unanimous patterns)
   - Total extra CVRs added to aggregate
-  - Final aggregate totals
+  - Final aggregate totals (with ballot counts, vote counts, and undervotes)
+- Style mapping output includes BallotType information for each CVR style
 - Optional summary statistics with `--summarize` flag
 
 **Options:**
@@ -135,10 +136,10 @@ This approach minimizes the number of ballots that need to be redacted while ens
 
 The anonymization tool automatically:
 - Computes descriptive style names based on contest patterns (format: `<n><R|S><m>` where n=contest count, R=rare/S=common, m=style number)
-- Maps CVR style names to descriptive style names
-- Detects information leakage when different CVR style names are used for ballots with the same contest pattern
+- Maps CVR style names to descriptive style names, including BallotType information for each style
+- Detects information leakage when different CVR style names or BallotType values are used for ballots with the same contest pattern
 - Provides optional summaries showing vote totals and probabilities by style
-- Displays detailed aggregation statistics including totals, contests needing balancing, and extra CVRs added
+- Displays detailed aggregation statistics including totals (with ballot counts, vote counts, and undervotes), contests needing balancing, and extra CVRs added
 
 ## Requirements
 
