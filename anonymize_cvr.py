@@ -16,7 +16,7 @@ Based on:
 import csv
 import sys
 from collections import defaultdict
-from typing import List, Dict, Tuple, Any, Optional, Iterable
+from typing import List, Dict, Tuple, Any, Optional, Iterable, Set
 
 from cvr_utils import TempCVRFile, is_parquet_file
 
@@ -1220,6 +1220,7 @@ def anonymize_cvr(
                 )
 
         # Step 3: Ensure at least min_ballots per contest in the aggregation
+        rare_contests: Set[str] = set()
         if headerlen < len(contests):
             # Map contest names to column indices
             contest_to_columns = defaultdict(set)
@@ -1264,15 +1265,20 @@ def anonymize_cvr(
                     contest_ballot_vote_counts,
                 )
 
-            # Find contests that need more ballots
+            rare_contests = {contest for contest, count in contest_ballot_counts.items() if count > 0}
+
+            # Find contests that need more ballots (only contests appearing on rare ballots)
             contests_needing_ballots = {}
             for contest_name, count in contest_ballot_counts.items():
+                if contest_name not in rare_contests:
+                    continue
                 if count < min_ballots:
                     needed = min_ballots - count
                     contests_needing_ballots[contest_name] = needed
 
             stats["contest_ballot_counts_after_rare"] = dict(contest_ballot_counts)
             stats["contest_ballot_vote_counts_after_rare"] = dict(contest_ballot_vote_counts)
+            stats["target_contests"] = sorted(rare_contests)
 
             stats["contest_ballot_counts"] = dict(contest_ballot_counts)
 
@@ -1402,7 +1408,11 @@ def anonymize_cvr(
             temp_aggregated, contests, choices, headerlen
         )
         total_ballots_in_agg = len(all_rare_ballots)
-        problematic_contests = check_unanimous_patterns(contest_totals, total_ballots_in_agg)
+        problematic_contests = [
+            entry
+            for entry in check_unanimous_patterns(contest_totals, total_ballots_in_agg)
+            if entry[0] in rare_contests
+        ]
 
         # Track which contests needed balancing
         if problematic_contests:
