@@ -79,7 +79,7 @@ def aggregate_votes(
         aggregated[0] = aggregate_id  # CvrNumber
     else:
         aggregated[0] = f"AGG-{len(rows)}"  # Indicate this is an aggregate
-    
+
     # Blank TabulatorNum, BatchId, RecordId, and ImprintedId to avoid revealing identifying information
     if len(aggregated) > 1:
         aggregated[1] = ""  # TabulatorNum
@@ -543,7 +543,9 @@ def find_contrasting_ballots_multi(
     return selected_ballots
 
 
-def compute_contest_pattern(row: List[str], contests: List[str], headerlen: int = 8) -> str:
+def compute_contest_pattern(
+    row: List[str], contests: List[str], headerlen: int = 8
+) -> str:
     """
     Compute contest pattern from a ballot row based solely on which contests have votes.
 
@@ -684,7 +686,9 @@ def determine_contests_for_row(
     contests_for_row: List[str] = []
     for contest_name in contest_names:
         col_indices = contest_to_columns.get(contest_name, [])
-        if any(col_idx < len(row) and row[col_idx].strip() != "" for col_idx in col_indices):
+        if any(
+            col_idx < len(row) and row[col_idx].strip() != "" for col_idx in col_indices
+        ):
             contests_for_row.append(contest_name)
     return contests_for_row
 
@@ -735,7 +739,9 @@ def select_balancing_ballot(
     coverage_weight = 10.0
     best_candidate = None
     best_score = -1.0
-    needed_contests = [contest for contest, need in contests_needing_ballots.items() if need > 0]
+    needed_contests = [
+        contest for contest, need in contests_needing_ballots.items() if need > 0
+    ]
 
     if not needed_contests:
         return None
@@ -752,7 +758,9 @@ def select_balancing_ballot(
             if cvr_num and cvr_num in aggregation_cvr_numbers:
                 continue
 
-            contests_for_row = determine_contests_for_row(row, needed_contests, contest_to_columns)
+            contests_for_row = determine_contests_for_row(
+                row, needed_contests, contest_to_columns
+            )
             if not contests_for_row:
                 continue
 
@@ -838,7 +846,7 @@ def analyze_styles(
         contest_pattern = compute_contest_pattern(row, contests, headerlen)
         cvr_style = row[stylecol].strip()
         pattern_to_cvr_styles[contest_pattern].add(cvr_style)
-        
+
         # Check BallotType column if known
         if ballot_type_idx is not None and len(row) > ballot_type_idx:
             ballot_type = row[ballot_type_idx].strip()
@@ -853,7 +861,7 @@ def analyze_styles(
                 f"has {len(cvr_styles)} different CVR style names: {sorted(cvr_styles)}. "
                 f"This may reveal additional information about voters."
             )
-    
+
     # Check if BallotType varies for same contest pattern
     if ballot_type_idx is not None:
         for pattern, ballot_types in pattern_to_ballot_types.items():
@@ -891,7 +899,12 @@ def analyze_styles(
     # Optional summary
     if summarize:
         summary = generate_summary(
-            all_rows, contests, choices, pattern_to_rows, pattern_to_descriptive, headerlen
+            all_rows,
+            contests,
+            choices,
+            pattern_to_rows,
+            pattern_to_descriptive,
+            headerlen,
         )
         result["summary"] = summary
 
@@ -943,7 +956,8 @@ def generate_summary(
             for contest_name, col_indices in contest_to_columns.items():
                 # Check if any column for this contest is non-empty (contest appears)
                 contest_appears = any(
-                    col_idx < len(row) and row[col_idx].strip() != "" for col_idx in col_indices
+                    col_idx < len(row) and row[col_idx].strip() != ""
+                    for col_idx in col_indices
                 )
 
                 if contest_appears:
@@ -966,7 +980,9 @@ def generate_summary(
                 prob_dict = {}
                 for col_idx in contest_to_columns[contest_name]:
                     choice_name = (
-                        choices[col_idx].strip() if col_idx < len(choices) else f"Choice{col_idx}"
+                        choices[col_idx].strip()
+                        if col_idx < len(choices)
+                        else f"Choice{col_idx}"
                     )
                     votes = choice_votes.get(choice_name, 0)
                     prob = votes / eligible_voters[contest_name]
@@ -1108,7 +1124,9 @@ def anonymize_cvr(
                     ballot_type_info = f", BallotType={ballot_types[0]}"
                 else:
                     ballot_type_info = f", BallotType={','.join(ballot_types)}"
-            print(f"  {cvr_style} ({count} {ballot_label}{ballot_type_info}) -> {descriptive}")
+            print(
+                f"  {cvr_style} ({count} {ballot_label}{ballot_type_info}) -> {descriptive}"
+            )
 
     # Print summary if requested
     if summarize and "summary" in style_analysis:
@@ -1152,7 +1170,10 @@ def anonymize_cvr(
         descriptive_name = pattern_to_descriptive.get(
             contest_pattern,
             compute_descriptive_style_name(
-                contest_pattern, len(rows), len(stats["rare_style_counts"]) + 1, min_ballots
+                contest_pattern,
+                len(rows),
+                len(stats["rare_style_counts"]) + 1,
+                min_ballots,
             ),
         )
 
@@ -1177,7 +1198,8 @@ def anonymize_cvr(
                     "ballot_count": len(rows),
                     "original_styles": sorted(style_name_counts.items()),
                     "ballot_types": {
-                        style: sorted(types) for style, types in style_ballot_types.items()
+                        style: sorted(types)
+                        for style, types in style_ballot_types.items()
                     },
                 }
             )
@@ -1225,7 +1247,7 @@ def anonymize_cvr(
                     common_styles.items(), key=lambda x: len(x[1]), reverse=True
                 )
                 style_sig, common_rows = sorted_common[0]
-                
+
                 # Calculate how many we can borrow
                 remaining_after_borrow = len(common_rows) - needed
                 if remaining_after_borrow < min_ballots and remaining_after_borrow > 0:
@@ -1240,7 +1262,7 @@ def anonymize_cvr(
                     common_styles[style_sig] = common_rows[needed:]
                     if len(common_styles[style_sig]) < min_ballots:
                         del common_styles[style_sig]
-                
+
                 all_rare_ballots.extend(borrowed)
                 stats["ballots_borrowed_for_minimum"] = len(borrowed)
             else:
@@ -1278,7 +1300,9 @@ def anonymize_cvr(
                 contest_name: {} for contest_name in contest_choice_meta.keys()
             }
             for row in all_rare_ballots:
-                update_choice_counts_from_row(row, contest_choice_counts, contest_choice_meta)
+                update_choice_counts_from_row(
+                    row, contest_choice_counts, contest_choice_meta
+                )
 
             contest_names_list = list(contest_to_columns.keys())
             contest_ballot_counts: Dict[str, int] = defaultdict(int)
@@ -1297,7 +1321,9 @@ def anonymize_cvr(
                     contest_ballot_vote_counts,
                 )
 
-            rare_contests = {contest for contest, count in contest_ballot_counts.items() if count > 0}
+            rare_contests = {
+                contest for contest, count in contest_ballot_counts.items() if count > 0
+            }
 
             # Find contests that need more ballots (only contests appearing on rare ballots)
             contests_needing_ballots = {}
@@ -1309,7 +1335,9 @@ def anonymize_cvr(
                     contests_needing_ballots[contest_name] = needed
 
             stats["contest_ballot_counts_after_rare"] = dict(contest_ballot_counts)
-            stats["contest_ballot_vote_counts_after_rare"] = dict(contest_ballot_vote_counts)
+            stats["contest_ballot_vote_counts_after_rare"] = dict(
+                contest_ballot_vote_counts
+            )
             stats["target_contests"] = sorted(rare_contests)
 
             stats["contest_ballot_counts"] = dict(contest_ballot_counts)
@@ -1349,7 +1377,9 @@ def anonymize_cvr(
                         contest_ballot_vote_counts,
                     )
 
-                update_choice_counts_from_row(row, contest_choice_counts, contest_choice_meta)
+                update_choice_counts_from_row(
+                    row, contest_choice_counts, contest_choice_meta
+                )
 
                 # Update remaining needs for contests we were targeting
                 for contest_name in contests_for_row:
@@ -1385,7 +1415,9 @@ def anonymize_cvr(
                     for row in found:
                         additional_ballots.append(row)
                         all_rare_ballots.append(row)
-                        update_choice_counts_from_row(row, contest_choice_counts, contest_choice_meta)
+                        update_choice_counts_from_row(
+                            row, contest_choice_counts, contest_choice_meta
+                        )
                         update_contest_presence_counts(
                             row,
                             contest_names_list,
@@ -1451,7 +1483,8 @@ def anonymize_cvr(
         # Track which contests needed balancing
         if problematic_contests:
             stats["contests_needing_balancing"] = [
-                (contest_name, winning_choice) for contest_name, winning_choice, _, _ in problematic_contests
+                (contest_name, winning_choice)
+                for contest_name, winning_choice, _, _ in problematic_contests
             ]
 
         # If we have problematic contests, add contrasting votes
@@ -1492,7 +1525,8 @@ def anonymize_cvr(
                     remaining_rows = [
                         row
                         for row in common_styles[style_sig]
-                        if len(row) == 0 or row[0].strip() not in contrasting_cvr_numbers
+                        if len(row) == 0
+                        or row[0].strip() not in contrasting_cvr_numbers
                     ]
                     if len(remaining_rows) < min_ballots:
                         del common_styles[style_sig]
@@ -1558,9 +1592,15 @@ def anonymize_cvr(
                 output_row = row.copy()
                 # Blank CountingGroup and PrecinctPortion if they exist
                 # Preserve BallotType - it should only reflect contest pattern
-                if counting_group_idx is not None and len(output_row) > counting_group_idx:
+                if (
+                    counting_group_idx is not None
+                    and len(output_row) > counting_group_idx
+                ):
                     output_row[counting_group_idx] = ""  # CountingGroup
-                if precinct_portion_idx is not None and len(output_row) > precinct_portion_idx:
+                if (
+                    precinct_portion_idx is not None
+                    and len(output_row) > precinct_portion_idx
+                ):
                     output_row[precinct_portion_idx] = ""  # PrecinctPortion
                 # BallotType is preserved as-is (not blanked for non-aggregated rows)
                 output_rows.append(output_row)
@@ -1640,7 +1680,9 @@ Examples:
   python anonymize_cvr.py input.csv output.csv --min-ballots 15
         """,
     )
-    parser.add_argument("input_file", help="Input CVR file path (CSV or Parquet format)")
+    parser.add_argument(
+        "input_file", help="Input CVR file path (CSV or Parquet format)"
+    )
     parser.add_argument("output_file", help="Output anonymized CVR file path")
     parser.add_argument(
         "--min-ballots",
@@ -1655,7 +1697,10 @@ Examples:
         "--headerlen", type=int, default=8, help="Number of header columns (default: 8)"
     )
     parser.add_argument(
-        "--summarize", "-s", action="store_true", help="Print detailed summary of CVR statistics"
+        "--summarize",
+        "-s",
+        action="store_true",
+        help="Print detailed summary of CVR statistics",
     )
 
     args = parser.parse_args()
@@ -1675,10 +1720,14 @@ Examples:
         print(f"  Original styles: {stats['original_styles']}")
         if stats.get("rare_style_counts"):
             print(f"  Rare styles ({len(stats['rare_style_counts'])}):")
-            for entry in sorted(stats["rare_style_counts"], key=lambda x: x["descriptive_name"]):
+            for entry in sorted(
+                stats["rare_style_counts"], key=lambda x: x["descriptive_name"]
+            ):
                 orig_styles = entry.get("original_styles") or []
                 if orig_styles:
-                    orig_desc = ", ".join(f"{name} ({count})" for name, count in orig_styles)
+                    orig_desc = ", ".join(
+                        f"{name} ({count})" for name, count in orig_styles
+                    )
                 else:
                     orig_desc = "unknown CVR style(s)"
                 ballot_types_info = entry.get("ballot_types", {})
@@ -1689,7 +1738,9 @@ Examples:
                     for types in ballot_types_info.values():
                         all_ballot_types.update(types)
                     if all_ballot_types:
-                        ballot_type_str = f", BallotType={','.join(sorted(all_ballot_types))}"
+                        ballot_type_str = (
+                            f", BallotType={','.join(sorted(all_ballot_types))}"
+                        )
                 print(
                     f"    {entry['descriptive_name']}: {entry['ballot_count']} ballot(s) from {orig_desc}{ballot_type_str}"
                 )
@@ -1701,29 +1752,39 @@ Examples:
         if stats.get("rare_ballots_initial", 0) > 0:
             print("\n=== Aggregation Statistics ===")
             print(f"  Initial rare ballots: {stats['rare_ballots_initial']}")
-            
+
             if stats.get("ballots_borrowed_for_minimum", 0) > 0:
-                print(f"  Ballots borrowed to reach minimum: {stats['ballots_borrowed_for_minimum']}")
-            
+                print(
+                    f"  Ballots borrowed to reach minimum: {stats['ballots_borrowed_for_minimum']}"
+                )
+
             if stats.get("contests_needing_ballots"):
                 print(
                     f"  Contests needing additional ballots ({len(stats['contests_needing_ballots'])}):"
                 )
                 contest_counts = stats.get("contest_ballot_counts", {})
                 min_required = stats.get("min_ballots", 10)
-                for contest, needed in sorted(stats["contests_needing_ballots"].items()):
+                for contest, needed in sorted(
+                    stats["contests_needing_ballots"].items()
+                ):
                     current = contest_counts.get(contest, 0)
                     print(
                         f"    {contest[:60]}: had {current}, needed {needed} more to reach {min_required}"
                     )
-                print(f"  Total ballots added for contests: {stats.get('ballots_added_for_contests', 0)}")
-            
+                print(
+                    f"  Total ballots added for contests: {stats.get('ballots_added_for_contests', 0)}"
+                )
+
             if stats.get("contests_needing_balancing"):
-                print(f"  Contests needing balancing ({len(stats['contests_needing_balancing'])}):")
+                print(
+                    f"  Contests needing balancing ({len(stats['contests_needing_balancing'])}):"
+                )
                 for contest, choice in stats["contests_needing_balancing"]:
                     print(f"    {contest[:60]}: {choice[:40]}")
-                print(f"  Total ballots added for balancing: {stats.get('ballots_added_for_balancing', 0)}")
-            
+                print(
+                    f"  Total ballots added for balancing: {stats.get('ballots_added_for_balancing', 0)}"
+                )
+
             total_extra = (
                 stats.get("ballots_borrowed_for_minimum", 0)
                 + stats.get("ballots_added_for_contests", 0)
@@ -1731,14 +1792,18 @@ Examples:
             )
             if total_extra > 0:
                 print(f"  Total extra CVRs added to aggregate: {total_extra}")
-            
+
             if stats.get("totals_after_rare_styles"):
                 print("\n  Totals after including all rare styles:")
-                eligible_counts_after_rare = stats.get("contest_ballot_counts_after_rare", {})
+                eligible_counts_after_rare = stats.get(
+                    "contest_ballot_counts_after_rare", {}
+                )
                 ballots_with_votes_after_rare = stats.get(
                     "contest_ballot_vote_counts_after_rare", {}
                 )
-                for contest_name, choice_totals in sorted(stats["totals_after_rare_styles"].items()):
+                for contest_name, choice_totals in sorted(
+                    stats["totals_after_rare_styles"].items()
+                ):
                     votes_cast = ballots_with_votes_after_rare.get(contest_name, 0)
                     eligible = eligible_counts_after_rare.get(contest_name, votes_cast)
                     undervotes = max(eligible - votes_cast, 0)
@@ -1749,12 +1814,14 @@ Examples:
                     for choice, count in sorted(choice_totals.items()):
                         if count > 0:
                             print(f"      {choice[:40]}: {count}")
-            
+
             if stats.get("final_aggregate_totals"):
                 print("\n  Final aggregate totals:")
                 final_contest_counts = stats.get("final_contest_ballot_counts", {})
                 final_contest_vote_counts = stats.get("final_contest_vote_counts", {})
-                for contest_name, choice_totals in sorted(stats["final_aggregate_totals"].items()):
+                for contest_name, choice_totals in sorted(
+                    stats["final_aggregate_totals"].items()
+                ):
                     votes_cast = final_contest_vote_counts.get(contest_name, 0)
                     eligible = final_contest_counts.get(contest_name, votes_cast)
                     undervotes = max(eligible - votes_cast, 0)
