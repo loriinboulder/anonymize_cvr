@@ -13,6 +13,7 @@ Based on:
 - C.R.S. 24-72-205.5 (Open Records Act requirement for < 10 ballots per style)
 """
 
+import argparse
 import csv
 import sys
 from collections import defaultdict
@@ -198,7 +199,7 @@ def tally_cvr_votes(
                                 vote_count = int(float(val))
                             else:
                                 # Individual ballot: value is 0 or 1
-                                vote_count = 1 if (val == "1" or val == 1) else 0
+                                vote_count = 1 if val == "1" else 0
 
                             if vote_count > 0:
                                 contest_totals[contest_name][choice_name] += vote_count
@@ -245,8 +246,6 @@ def verify_tally_match(
     Returns:
         Tuple of (match: bool, details: dict) where details contains mismatch information
     """
-    from cvr_utils import TempCVRFile, is_parquet_file
-
     # Read original CVR
     with TempCVRFile(original_file) as orig_csv:
         with open(orig_csv, "r", encoding="utf-8") as f:
@@ -526,7 +525,7 @@ def find_contrasting_ballots_multi(
             # to ensure we have at least 3 contrasting votes per contest
             if not contests_needed:
                 # Count how many ballots we have for each contest
-                contest_counts = {}
+                contest_counts: Dict[str, int] = {}
                 for _, satisfied_list, _ in ballot_scores[: len(selected_ballots)]:
                     for c in satisfied_list:
                         contest_counts[c] = contest_counts.get(c, 0) + 1
@@ -781,7 +780,7 @@ def analyze_styles(
     min_ballots: int = 10,
     summarize: bool = False,
     ballot_type_idx: Optional[int] = None,
-) -> Dict[str, any]:
+) -> Dict[str, Any]:
     """
     Analyze styles in the CVR file.
 
@@ -906,7 +905,7 @@ def generate_summary(
     pattern_to_rows: Dict[str, List[List[str]]],
     pattern_to_descriptive: Dict[str, str],
     headerlen: int,
-) -> Dict[str, any]:
+) -> Dict[str, Any]:
     """Generate summary statistics for the CVR."""
     # Map contest names to column indices
     contest_to_columns: Dict[str, List[int]] = defaultdict(list)
@@ -932,7 +931,7 @@ def generate_summary(
                             contest_totals[contest_name][choice_name] += 1
 
     # Calculate ballot counts and probabilities for each style
-    style_stats: Dict[str, Dict[str, any]] = {}
+    style_stats: Dict[str, Dict[str, Any]] = {}
     for pattern, rows in pattern_to_rows.items():
         descriptive_name = pattern_to_descriptive[pattern]
 
@@ -1282,8 +1281,8 @@ def anonymize_cvr(
                 update_choice_counts_from_row(row, contest_choice_counts, contest_choice_meta)
 
             contest_names_list = list(contest_to_columns.keys())
-            contest_ballot_counts = defaultdict(int)
-            contest_ballot_vote_counts = defaultdict(int)
+            contest_ballot_counts: Dict[str, int] = defaultdict(int)
+            contest_ballot_vote_counts: Dict[str, int] = defaultdict(int)
             aggregation_cvr_numbers = set()
             for row in all_rare_ballots:
                 if len(row) > 0:
@@ -1631,8 +1630,6 @@ def anonymize_cvr(
 
 def main():
     """Command-line interface for CVR anonymization."""
-    import argparse
-
     parser = argparse.ArgumentParser(
         description="Anonymize CVR files by aggregating rare styles (supports CSV and Parquet formats)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
