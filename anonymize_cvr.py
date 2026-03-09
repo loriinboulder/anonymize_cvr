@@ -22,29 +22,6 @@ from typing import List, Dict, Tuple, Any, Optional, Iterable, Set
 from cvr_utils import TempCVRFile, is_parquet_file
 
 
-def pull_style_signature(row: List[str], headerlen: int = 8, stylecol: int = 6) -> str:
-    """
-    Convert a CVR row into a style signature string based solely on contest pattern.
-
-    The signature includes only the contest bitmap:
-    - For each vote column: "1" if vote was allowed (non-empty), "0" if empty (contest not on ballot)
-
-    PrecinctPortion is not used in the signature to avoid relying on geographic information.
-    Styles are identified purely by which contests appear on the ballot.
-
-    Args:
-        row: List of strings representing a CVR row
-        headerlen: Number of header columns before vote data starts (default 8)
-        stylecol: Index of the style column (unused, kept for compatibility)
-
-    Returns:
-        Style signature string (contest bitmap only)
-    """
-    # For each vote column, indicate if contest appeared on ballot (1) or not (0)
-    vote_indicators = ["1" if vote.strip() != "" else "0" for vote in row[headerlen:]]
-    return "".join(vote_indicators)
-
-
 def aggregate_votes(
     rows: List[List[str]],
     headerlen: int = 8,
@@ -1130,7 +1107,7 @@ def anonymize_cvr(
     # Group rows by style signature
     style_groups: Dict[str, List[List[str]]] = defaultdict(list)
     for row in all_rows:
-        style_sig = pull_style_signature(row, headerlen, stylecol)
+        style_sig = compute_contest_pattern(row, contests, headerlen)
         style_groups[style_sig].append(row)
 
     stats["original_styles"] = len(style_groups)
