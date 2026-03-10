@@ -1120,16 +1120,7 @@ def anonymize_cvr(
     for style_sig, rows in style_groups.items():
         if not rows:
             continue
-        contest_pattern = compute_contest_pattern(rows[0], contests, headerlen)
-        descriptive_name = pattern_to_descriptive.get(
-            contest_pattern,
-            compute_descriptive_style_name(
-                contest_pattern,
-                len(rows),
-                len(stats["rare_style_counts"]) + 1,
-                min_ballots,
-            ),
-        )
+        descriptive_name = pattern_to_descriptive[style_sig]
 
         if len(rows) < min_ballots:
             rare_styles[style_sig] = rows
