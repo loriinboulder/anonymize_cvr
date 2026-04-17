@@ -1,1768 +1,533 @@
 #!/usr/bin/env python3
 """
-Anonymize Cast Vote Records (CVR) by aggregating rare styles.
+Anonymize Cast Vote Records (CVR) per Colorado C.R.S. 24-72-205.5.
 
-This module addresses the requirement from Colorado Election Rule that CVRs
-with fewer than 10 ballots per style must be anonymized to protect voter privacy.
-Rare styles are aggregated together to meet the minimum threshold.
+Ballot styles with fewer than MIN_BALLOTS ballots must be aggregated to
+protect voter privacy.
 
-Based on:
-- Colorado Risk-Limiting Tabulation Audit: Preserving Anonymity of Cast Vote Record
-  (Branscomb et al., March 9, 2018)
-- Election Rule 21 (CVR definition)
-- C.R.S. 24-72-205.5 (Open Records Act requirement for < 10 ballots per style)
+Terminology used throughout this module:
+
+  style         — the contest pattern for a ballot, represented as a string
+                  of '1' and '0' characters.  Each position corresponds to
+                  one contest (in the order contests appear in the CVR file);
+                  '1' means the contest is present on the ballot, '0' means
+                  it is absent.  This is the only style definition that
+                  drives redaction decisions.
+
+  named_style   — the value in the column identified by --stylecol, if any.
+                  Assigned by the voting machine; almost certainly obsolete
+                  in Colorado, but still accepted.
+
+  ballot_type   — the value in the BallotType column, if present.
 """
 
 import argparse
 import csv
 import sys
 from collections import defaultdict
-from typing import List, Dict, Tuple, Any, Optional, Iterable, Set
+from typing import Dict, List, Optional, Set
 
-from cvr_utils import TempCVRFile, is_parquet_file
+from cvr_utils import TempCVRFile
+
+MIN_BALLOTS_DEFAULT = 10
 
 
-def aggregate_votes(
-    rows: List[List[str]],
-    headerlen: int = 8,
-    aggregate_id: str = "",
-    ballot_type_idx: Optional[int] = None,
-    precinct_portion_idx: Optional[int] = None,
-    counting_group_idx: Optional[int] = None,
-) -> List[str]:
+# ---------------------------------------------------------------------------
+# CvrDatabase
+# ---------------------------------------------------------------------------
+
+
+class CvrDatabase:
     """
-    Aggregate multiple CVR rows into a single aggregated row.
+    Reads a CVR file and organizes its contents for analysis and redaction.
 
-    Sums vote counts for each choice column, anonymizing header information.
+    The Colorado CVR CSV format has four header rows, then one ballot per row:
+      Row 1: version / election name
+      Row 2: contest names (one name per choice column, repeated)
+      Row 3: choice (candidate) names, one per column
+      Row 4: column headers (CvrNumber, TabulatorNum, BatchId, RecordId,
+              ImprintedId, CountingGroup, PrecinctPortion, BallotType, ...)
+      Rows 5+: one ballot per row
 
-    Args:
-        rows: List of CVR rows to aggregate
-        headerlen: Number of header columns before vote data starts
-        aggregate_id: Identifier for this aggregate (e.g., "AGGREGATED-1")
+    A ballot's style is a string of '1' and '0' characters, one per contest
+    in contest_names order.  '1' means the contest is present on the ballot
+    (at least one choice column is non-empty), '0' means it is absent.
 
-    Returns:
-        Single aggregated row as a list of strings
+    After construction the following are available:
+
+      ballots               — all ballot rows as lists of strings
+      contest_names         — ordered list of unique contest names
+      ballots_by_style      — ballots grouped by style string
+      ballots_by_named_style — ballots grouped by named_style value
+                               (only populated when named_style_col is set)
+      ballots_by_ballot_type — ballots grouped by BallotType value
+                               (only populated when the column exists)
+      ballots_by_precinct   — ballots grouped by PrecinctPortion value
+                               (only populated when redact_on_precinct is True
+                               and the PrecinctPortion column exists)
+
+    For leakage detection:
+      named_styles_by_style — style -> set of named_style values for that style
+      ballot_types_by_style — style -> set of ballot_type values for that style
     """
-    if not rows:
-        return []
-
-    # Create header with anonymized identifiers
-    # Format: [CvrNumber, TabulatorNum, BatchId, RecordId, ImprintedId,
-    #          CountingGroup, PrecinctPortion, BallotType, ...vote columns...]
-    aggregated = rows[0][:headerlen].copy()
-
-    # Anonymize identifying fields (indices 0-4: CvrNumber, TabulatorNum, BatchId, RecordId, ImprintedId)
-    if aggregate_id:
-        aggregated[0] = aggregate_id  # CvrNumber
-    else:
-        aggregated[0] = f"AGG-{len(rows)}"  # Indicate this is an aggregate
-
-    # Blank TabulatorNum, BatchId, RecordId, and ImprintedId to avoid revealing identifying information
-    if len(aggregated) > 1:
-        aggregated[1] = ""  # TabulatorNum
-    if len(aggregated) > 2:
-        aggregated[2] = ""  # BatchId
-    if len(aggregated) > 3:
-        aggregated[3] = ""  # RecordId
-    if len(aggregated) > 4:
-        aggregated[4] = ""  # ImprintedId
-
-    # CountingGroup - blank to avoid revealing additional information
-    if counting_group_idx is not None and len(aggregated) > counting_group_idx:
-        aggregated[counting_group_idx] = ""
-
-    # PrecinctPortion - blank to avoid revealing geographic/precinct information
-    if precinct_portion_idx is not None and len(aggregated) > precinct_portion_idx:
-        aggregated[precinct_portion_idx] = ""
-
-    # BallotType - set to "AGGREGATED" for aggregated rows (if column exists)
-    if ballot_type_idx is not None:
-        if len(aggregated) > ballot_type_idx:
-            aggregated[ballot_type_idx] = "AGGREGATED"
-
-    # Aggregate vote columns (sum numeric values)
-    num_cols = max(len(row) for row in rows)
-    for col_idx in range(headerlen, num_cols):
-        total = 0
-        for row in rows:
-            if col_idx < len(row):
-                val = row[col_idx].strip()
-                if val and val.replace(".", "").replace("-", "").isdigit():
-                    try:
-                        total += float(val)
-                    except ValueError:
-                        pass  # Skip non-numeric values
-        aggregated.append(str(int(total)) if total == int(total) else str(total))
-
-    return aggregated
-
-
-def tally_cvr_votes(
-    rows: List[List[str]],
-    contests: List[str],
-    choices: List[str],
-    headerlen: int = 8,
-) -> Dict[str, Dict[str, int]]:
-    """
-    Tally votes from CVR rows (handles both individual ballots and aggregated rows).
-
-    Args:
-        rows: List of CVR data rows (individual ballots or aggregated rows)
-        contests: Contest names row from CVR header
-        choices: Choice names row from CVR header
-        headerlen: Number of header columns before vote data starts
-
-    Returns:
-        Dictionary mapping contest names to dictionaries of choice names to vote counts
-    """
-    # Map contest names to their column indices
-    contest_to_columns: Dict[str, List[tuple]] = defaultdict(list)
-    for col_idx in range(headerlen, len(contests)):
-        contest_name = contests[col_idx].strip()
-        if contest_name and col_idx < len(choices):
-            choice_name = choices[col_idx].strip()
-            contest_to_columns[contest_name].append((col_idx, choice_name))
-
-    # Tally votes for each contest
-    contest_totals: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
-    for row in rows:
-        # Check if this is an aggregated row (CvrNumber starts with "AGGREGATED-")
-        is_aggregated = row[0].strip().startswith("AGGREGATED-")
-
-        for contest_name, col_choice_pairs in contest_to_columns.items():
-            for col_idx, choice_name in col_choice_pairs:
-                if col_idx < len(row):
-                    val = row[col_idx].strip()
-                    if val:
-                        try:
-                            if is_aggregated:
-                                # Aggregated row: value is already a count
-                                vote_count = int(float(val))
-                            else:
-                                # Individual ballot: value is 0 or 1
-                                vote_count = 1 if val == "1" else 0
-
-                            if vote_count > 0:
-                                contest_totals[contest_name][choice_name] += vote_count
-                        except (ValueError, TypeError):
-                            pass
-
-    return dict(contest_totals)
-
-
-def tally_aggregated_votes_by_contest(
-    aggregated_row: List[str],
-    contests: List[str],
-    choices: List[str],
-    headerlen: int = 8,
-) -> Dict[str, Dict[str, int]]:
-    """
-    Tally votes from an aggregated row by contest and choice.
-
-    Args:
-        aggregated_row: Aggregated CVR row (with vote counts as integers)
-        contests: Contest names row from CVR header
-        choices: Choice names row from CVR header
-        headerlen: Number of header columns before vote data starts
-
-    Returns:
-        Dictionary mapping contest names to dictionaries of choice names to vote counts
-    """
-    return tally_cvr_votes([aggregated_row], contests, choices, headerlen)
-
-
-def verify_tally_match(
-    original_file: str,
-    anonymized_file: str,
-    headerlen: int = 8,
-) -> Tuple[bool, Dict[str, Any]]:
-    """
-    Verify that vote tallies in anonymized CVR match the original CVR.
-
-    Args:
-        original_file: Path to original CVR file
-        anonymized_file: Path to anonymized CVR file
-        headerlen: Number of header columns before vote data starts
-
-    Returns:
-        Tuple of (match: bool, details: dict) where details contains mismatch information
-    """
-    # Read original CVR
-    with TempCVRFile(original_file) as orig_csv:
-        with open(orig_csv, "r", encoding="utf-8") as f:
-            reader = csv.reader(f)
-            orig_version = next(reader)
-            orig_contests = next(reader)
-            orig_choices = next(reader)
-            orig_headers = next(reader)
-            orig_rows = list(reader)
-
-    # Read anonymized CVR
-    with TempCVRFile(anonymized_file) as anon_csv:
-        with open(anon_csv, "r", encoding="utf-8") as f:
-            reader = csv.reader(f)
-            anon_version = next(reader)
-            anon_contests = next(reader)
-            anon_choices = next(reader)
-            anon_headers = next(reader)
-            anon_rows = list(reader)
-
-    # Tally votes
-    orig_totals = tally_cvr_votes(orig_rows, orig_contests, orig_choices, headerlen)
-    anon_totals = tally_cvr_votes(anon_rows, anon_contests, anon_choices, headerlen)
-
-    # Compare tallies
-    all_contests = set(orig_totals.keys()) | set(anon_totals.keys())
-    mismatches = []
-    match = True
-
-    for contest_name in sorted(all_contests):
-        orig_choices_dict = orig_totals.get(contest_name, {})
-        anon_choices_dict = anon_totals.get(contest_name, {})
-
-        all_choices = set(orig_choices_dict.keys()) | set(anon_choices_dict.keys())
-        for choice_name in sorted(all_choices):
-            orig_count = orig_choices_dict.get(choice_name, 0)
-            anon_count = anon_choices_dict.get(choice_name, 0)
-            if orig_count != anon_count:
-                match = False
-                mismatches.append(
-                    {
-                        "contest": contest_name,
-                        "choice": choice_name,
-                        "original": orig_count,
-                        "anonymized": anon_count,
-                        "difference": anon_count - orig_count,
-                    }
-                )
-
-    details = {
-        "match": match,
-        "mismatches": mismatches,
-        "original_totals": orig_totals,
-        "anonymized_totals": anon_totals,
-    }
-
-    return match, details
-
-
-def check_unanimous_patterns(
-    contest_totals: Dict[str, Dict[str, int]], total_ballots: int
-) -> List[tuple]:
-    """
-    Check for unanimous or near-unanimous vote patterns in aggregated results.
-
-    A pattern is considered near-unanimous if all but 2 votes (or fewer) are for the same candidate.
-
-    Args:
-        contest_totals: Dictionary mapping contest names to choice vote counts
-        total_ballots: Total number of ballots in the aggregation
-
-    Returns:
-        List of tuples (contest_name, winning_choice, vote_count, total_votes) for unanimous/near-unanimous contests
-    """
-    problematic_contests = []
-    for contest_name, choice_votes in contest_totals.items():
-        if not choice_votes:
-            continue
-
-        total_votes = sum(choice_votes.values())
-        if total_votes == 0:
-            continue
-
-        # Find the choice with the most votes
-        max_choice = max(choice_votes.items(), key=lambda x: x[1])
-        max_votes = max_choice[1]
-        other_votes = total_votes - max_votes
-
-        # Check if all but 2 or fewer votes are for the same candidate
-        # (near-unanimous: at most 2 votes for other candidates)
-        if other_votes <= 2:
-            problematic_contests.append(
-                (contest_name, max_choice[0], max_votes, total_votes)
-            )
-
-    return problematic_contests
-
-
-def find_ballots_with_contest(
-    contest_name: str,
-    common_styles: Dict[str, List[List[str]]],
-    contests: List[str],
-    headerlen: int = 8,
-    min_ballots: int = 10,
-    needed_count: int = 10,
-    exclude_cvr_numbers: set = None,
-) -> List[List[str]]:
-    """
-    Find ballots from common styles that have a specific contest.
-
-    Args:
-        contest_name: Contest name to find ballots for
-        common_styles: Dictionary of common style signatures to their ballot rows
-        contests: Contest names row from CVR header
-        headerlen: Number of header columns before vote data starts
-        min_ballots: Minimum ballots per style (common styles must have > this)
-        needed_count: Number of ballots needed
-        exclude_cvr_numbers: Set of CvrNumbers to exclude (already used)
-
-    Returns:
-        List of ballot rows that have the specified contest
-    """
-    if exclude_cvr_numbers is None:
-        exclude_cvr_numbers = set()
-
-    # Find column indices for the contest
-    contest_col_indices = []
-    for col_idx in range(headerlen, len(contests)):
-        if contests[col_idx].strip() == contest_name:
-            contest_col_indices.append(col_idx)
-
-    if not contest_col_indices:
-        return []  # Contest not found
-
-    found_ballots = []
-    for style_sig, rows in common_styles.items():
-        if len(rows) <= min_ballots:
-            continue  # Only use styles with more than min_ballots
-
-        for row in rows:
-            # Check CvrNumber
-            cvr_num = row[0].strip()
-            if cvr_num in exclude_cvr_numbers:
-                continue
-
-            # Check if this ballot has the contest (any column for this contest is non-empty)
-            has_contest = any(
-                col_idx < len(row) and row[col_idx].strip() != ""
-                for col_idx in contest_col_indices
-            )
-
-            if has_contest:
-                found_ballots.append(row)
-                if len(found_ballots) >= needed_count:
-                    return found_ballots
-
-    return found_ballots
-
-
-def find_contrasting_ballots_multi(
-    problematic_contests: List[tuple],
-    common_styles: Dict[str, List[List[str]]],
-    contests: List[str],
-    choices: List[str],
-    headerlen: int = 8,
-    min_ballots: int = 10,
-) -> List[List[str]]:
-    """
-    Find ballots from common styles that vote differently for multiple problematic contests.
-
-    This minimizes the number of ballots needed by finding ballots that satisfy multiple
-    contrasting vote requirements simultaneously.
-
-    Args:
-        problematic_contests: List of tuples (contest_name, winning_choice, vote_count, total_votes)
-        common_styles: Dictionary of common style signatures to their ballot rows
-        contests: Contest names row from CVR header
-        choices: Choice names row from CVR header
-        headerlen: Number of header columns before vote data starts
-        min_ballots: Minimum ballots per style (common styles must have > this)
-
-    Returns:
-        List of ballot rows that vote differently in one or more problematic contests
-    """
-    if not problematic_contests:
-        return []
-
-    # Build mapping of contest to column indices and winning choice column
-    contest_info = {}
-    for contest_name, winning_choice, _, _ in problematic_contests:
-        contest_col_indices = []
-        for col_idx in range(headerlen, len(contests)):
-            if contests[col_idx].strip() == contest_name:
-                contest_col_indices.append(col_idx)
-
-        if not contest_col_indices:
-            continue
-
-        # Find winning choice column index
-        winning_col_idx = None
-        for col_idx in contest_col_indices:
-            if col_idx < len(choices) and choices[col_idx].strip() == winning_choice:
-                winning_col_idx = col_idx
-                break
-
-        contest_info[contest_name] = {
-            "col_indices": contest_col_indices,
-            "winning_col_idx": winning_col_idx,
-        }
-
-    # Score each ballot by how many problematic contests it votes differently in
-    ballot_scores = []
-    for style_sig, rows in common_styles.items():
-        if len(rows) <= min_ballots:
-            continue  # Only use styles with more than min_ballots
-
-        for row in rows:
-            # Check which problematic contests this ballot votes differently in
-            satisfied_contests = []
-            for contest_name, _, _, _ in problematic_contests:
-                if contest_name not in contest_info:
-                    continue
-
-                info = contest_info[contest_name]
-                contest_col_indices = info["col_indices"]
-                winning_col_idx = info["winning_col_idx"]
-
-                # Check if ballot has this contest
-                has_contest = any(
-                    col_idx < len(row) and row[col_idx].strip() != ""
-                    for col_idx in contest_col_indices
-                )
-                if not has_contest:
-                    continue
-
-                # Check if votes differently
-                votes_differently = False
-                if winning_col_idx is not None and winning_col_idx < len(row):
-                    if row[winning_col_idx].strip() != "1":
-                        # Check if voted for any other choice
-                        for col_idx in contest_col_indices:
-                            if col_idx != winning_col_idx and col_idx < len(row):
-                                if row[col_idx].strip() == "1":
-                                    votes_differently = True
-                                    satisfied_contests.append(contest_name)
-                                    break
-
-            if satisfied_contests:
-                # Score: number of contests satisfied, prefer ballots that satisfy more
-                ballot_scores.append((len(satisfied_contests), satisfied_contests, row))
-
-    # Sort by score (highest first) to prioritize ballots that satisfy multiple contests
-    ballot_scores.sort(key=lambda x: x[0], reverse=True)
-
-    # Greedily select ballots to cover all problematic contests
-    # Track which contests still need contrasting votes
-    contests_needed = {contest_name for contest_name, _, _, _ in problematic_contests}
-    selected_ballots = []
-    satisfied_contests_set = set()
-
-    for score, satisfied, row in ballot_scores:
-        # Check if this ballot helps with any remaining needed contests
-        row_contests = set(satisfied)
-        if row_contests & contests_needed:
-            selected_ballots.append(row)
-            satisfied_contests_set.update(row_contests)
-            contests_needed -= row_contests
-
-            # If we've satisfied all contests, we might still need a few more
-            # to ensure we have at least 3 contrasting votes per contest
-            if not contests_needed:
-                # Count how many ballots we have for each contest
-                contest_counts: Dict[str, int] = {}
-                for _, satisfied_list, _ in ballot_scores[: len(selected_ballots)]:
-                    for c in satisfied_list:
-                        contest_counts[c] = contest_counts.get(c, 0) + 1
-
-                # Check if we need more for any contest (want at least 3)
-                all_sufficient = True
-                for contest_name, _, _, _ in problematic_contests:
-                    if contest_counts.get(contest_name, 0) < 3:
-                        all_sufficient = False
-                        contests_needed.add(contest_name)
-
-                if all_sufficient:
+
+    def __init__(
+        self,
+        input_file: str,
+        headerlen: int,
+        named_style_col: Optional[int],
+        redact_on_precinct: bool,
+    ) -> None:
+        """
+        Read and validate the CVR file, then build all groupings.
+
+        Args:
+            input_file:         Path to the CVR file (CSV or Parquet).
+            headerlen:          Number of header columns before vote data begins.
+                                Pass 0 to auto-detect from the contests row.
+            named_style_col:    Column index of the named_style field, or None.
+            redact_on_precinct: If True, populate ballots_by_precinct for
+                                per-precinct rare-style detection.
+        """
+        self.input_file = input_file
+        self.headerlen = headerlen  # may be updated to auto-detected value in _read_file()
+        self.named_style_col = named_style_col
+        self.redact_on_precinct = redact_on_precinct
+
+        # Four header rows read from the file.
+        self.version: List[str] = []
+        self.contests: List[str] = []
+        self.choices: List[str] = []
+        self.headers: List[str] = []
+
+        # All ballot rows.
+        self.ballots: List[List[str]] = []
+
+        # Line terminator found in the file (needed when writing output later).
+        self.lineterminator: str = ""
+
+        # Column indices for named special columns.  None means not present.
+        self.ballot_type_idx: Optional[int] = None
+        self.precinct_portion_idx: Optional[int] = None
+        self.counting_group_idx: Optional[int] = None
+
+        # Ordered list of unique contest names (defines positions in style strings).
+        self.contest_names: List[str] = []
+
+        # contest name -> list of column indices for that contest's choices
+        self.contest_to_columns: Dict[str, List[int]] = {}
+
+        # Ballots grouped by style string.
+        self.ballots_by_style: Dict[str, List[List[str]]] = {}
+
+        # Ballots grouped by named_style value (only when named_style_col is set).
+        self.ballots_by_named_style: Dict[str, List[List[str]]] = {}
+
+        # Ballots grouped by BallotType value (only when ballot_type_idx is set).
+        self.ballots_by_ballot_type: Dict[str, List[List[str]]] = {}
+
+        # Ballots grouped by PrecinctPortion value.
+        # Only populated when redact_on_precinct is True and precinct_portion_idx is set.
+        self.ballots_by_precinct: Dict[str, List[List[str]]] = {}
+
+        # For leakage detection: per style, which named_style / ballot_type values appear.
+        self.named_styles_by_style: Dict[str, Set[str]] = {}
+        self.ballot_types_by_style: Dict[str, Set[str]] = {}
+
+        self._read_file()
+        self._validate()
+        self._build_contest_map()
+        self._validate_ballot_contents()
+        self._group_ballots()
+
+    # ------------------------------------------------------------------
+    # Private helpers
+    # ------------------------------------------------------------------
+
+    def _read_file(self) -> None:
+        """Read all rows from the CVR file and detect the line terminator."""
+        with TempCVRFile(self.input_file) as csv_file:
+            # Detect the line terminator so we can reproduce it in the output.
+            with open(csv_file, "rb") as raw:
+                chunk = raw.read(1024)
+                if b"\r\n" in chunk:
+                    self.lineterminator = "\r\n"
+                elif b"\r" in chunk:
+                    self.lineterminator = "\r"
+                else:
+                    self.lineterminator = "\n"
+
+            with open(csv_file, "r", encoding="utf-8") as f:
+                reader = csv.reader(f)
+                self.version = next(reader)
+                self.contests = next(reader)
+                self.choices = next(reader)
+                self.headers = next(reader)
+                self.ballots = []
+                for row in reader:
+                    if row:
+                        self.ballots.append(row)
+
+        # Compute headerlen from the contests row if the caller did not specify one.
+        # The contests row begins with one empty cell per header column, then
+        # the first non-empty cell is where contest (vote) columns begin.
+        if self.headerlen == 0:
+            for cell in self.contests:
+                if cell.strip() == "":
+                    self.headerlen += 1
+                else:
                     break
-
-    return selected_ballots
-
-
-def compute_contest_pattern(
-    row: List[str], contests: List[str], headerlen: int = 8
-) -> str:
-    """
-    Compute contest pattern from a ballot row based solely on which contests have votes.
-
-    Returns a binary string indicating which contests appear on the ballot (1) or not (0).
-    A contest appears if any of its choice columns is non-empty.
-
-    Args:
-        row: List of strings representing a CVR row
-        contests: Contest names row from CVR header
-        headerlen: Number of header columns before vote data starts
-
-    Returns:
-        Binary string pattern (e.g., "110" means contests 1 and 2 appear, 3 doesn't)
-    """
-    # Group columns by contest
-    contest_to_columns: Dict[str, List[int]] = defaultdict(list)
-    for col_idx in range(headerlen, len(contests)):
-        contest_name = contests[col_idx].strip()
-        if contest_name:
-            contest_to_columns[contest_name].append(col_idx)
-
-    # Check if each contest appears (any column for that contest is non-empty)
-    contest_pattern = []
-    for contest_name in sorted(contest_to_columns.keys()):
-        col_indices = contest_to_columns[contest_name]
-        contest_appears = any(
-            col_idx < len(row) and row[col_idx].strip() != "" for col_idx in col_indices
-        )
-        contest_pattern.append("1" if contest_appears else "0")
-
-    return "".join(contest_pattern)
-
-
-def compute_descriptive_style_name(
-    contest_pattern: str, ballot_count: int, style_number: int, min_ballots: int = 10
-) -> str:
-    """
-    Compute a descriptive style name based on contest pattern.
-
-    Format: <n><R|S><m>
-    - n: number of contests on the ballot
-    - R: Rare (less than min_ballots) or S: Common (min_ballots or more)
-    - m: unique style number
-
-    Args:
-        contest_pattern: Binary string indicating which contests appear
-        ballot_count: Number of ballots with this pattern
-        style_number: Unique sequential number for this style
-        min_ballots: Minimum ballots to be considered common
-
-    Returns:
-        Descriptive style name (e.g., "1R1", "2S2", "1S3")
-    """
-    contest_count = contest_pattern.count("1")
-    rarity = "R" if ballot_count < min_ballots else "S"
-    return f"{contest_count}{rarity}{style_number}"
-
-
-def update_choice_counts_from_row(
-    row: List[str],
-    contest_choice_counts: Dict[str, Dict[str, int]],
-    contest_choice_meta: Dict[str, Dict[int, str]],
-) -> None:
-    """
-    Update contest choice counts using the votes in a single row (ballot).
-    """
-    for contest_name, col_map in contest_choice_meta.items():
-        if contest_name not in contest_choice_counts:
-            contest_choice_counts[contest_name] = {}
-
-        for col_idx, choice_name in col_map.items():
-            if col_idx >= len(row):
-                continue
-            value = row[col_idx].strip()
-            if not value or value == "0":
-                continue
-            try:
-                increment = int(float(value))
-            except ValueError:
-                increment = 1
-            contest_choice_counts[contest_name][choice_name] = (
-                contest_choice_counts[contest_name].get(choice_name, 0) + increment
-            )
-
-
-def compute_imbalance_gain_for_ballot(
-    contest_name: str,
-    row: List[str],
-    contest_choice_counts: Dict[str, Dict[str, int]],
-    contest_choice_meta: Dict[str, Dict[int, str]],
-) -> float:
-    """
-    Estimate how much a ballot will reduce vote imbalance for a contest.
-    Imbalance metric: max_votes - sum(other_votes).
-    """
-    if contest_name not in contest_choice_meta:
-        return 0.0
-
-    choice_counts = contest_choice_counts.get(contest_name, {})
-    total_votes = sum(choice_counts.values())
-    current_max = max(choice_counts.values()) if choice_counts else 0
-    current_others = total_votes - current_max
-    current_gap = current_max - current_others
-
-    contributions: Dict[str, int] = {}
-    for col_idx, choice_name in contest_choice_meta[contest_name].items():
-        if col_idx >= len(row):
-            continue
-        value = row[col_idx].strip()
-        if not value or value == "0":
-            continue
-        contributions[choice_name] = contributions.get(choice_name, 0) + 1
-
-    if not contributions:
-        return 0.0
-
-    new_counts = dict(choice_counts)
-    for choice_name, inc in contributions.items():
-        new_counts[choice_name] = new_counts.get(choice_name, 0) + inc
-
-    new_total = total_votes + sum(contributions.values())
-    new_max = max(new_counts.values()) if new_counts else 0
-    new_others = new_total - new_max
-    new_gap = new_max - new_others
-
-    improvement = current_gap - new_gap
-    return max(0.0, improvement)
-
-
-def determine_contests_for_row(
-    row: List[str],
-    contest_names: List[str],
-    contest_to_columns: Dict[str, Iterable[int]],
-) -> List[str]:
-    """
-    Determine which contests appear on a ballot row.
-    """
-    contests_for_row: List[str] = []
-    for contest_name in contest_names:
-        col_indices = contest_to_columns.get(contest_name, [])
-        if any(
-            col_idx < len(row) and row[col_idx].strip() != "" for col_idx in col_indices
-        ):
-            contests_for_row.append(contest_name)
-    return contests_for_row
-
-
-def update_contest_presence_counts(
-    row: List[str],
-    contest_names: List[str],
-    contest_to_columns: Dict[str, Iterable[int]],
-    ballot_counts: Dict[str, int],
-    ballot_with_vote_counts: Dict[str, int],
-) -> None:
-    """
-    Update contest presence counts (ballots containing contest and ballots casting votes).
-    """
-    for contest_name in contest_names:
-        col_indices = contest_to_columns.get(contest_name, [])
-        contest_present = False
-        contest_has_vote = False
-        for col_idx in col_indices:
-            if col_idx >= len(row):
-                continue
-            val = row[col_idx].strip()
-            if val != "":
-                contest_present = True
-                if val != "0":
-                    contest_has_vote = True
-        if contest_present:
-            ballot_counts[contest_name] += 1
-            if contest_has_vote:
-                ballot_with_vote_counts[contest_name] += 1
-
-
-def select_balancing_ballot(
-    common_styles: Dict[str, List[List[str]]],
-    contests_needing_ballots: Dict[str, int],
-    contest_to_columns: Dict[str, List[int]],
-    contest_choice_counts: Dict[str, Dict[str, int]],
-    contest_choice_meta: Dict[str, Dict[int, str]],
-    aggregation_cvr_numbers: set,
-    min_ballots: int,
-) -> Optional[Tuple[str, int, List[str], List[str], float]]:
-    """
-    Select the ballot that best improves contest coverage and vote balance.
-
-    Returns:
-        Tuple of (style_signature, row_index, row, contests_covered, imbalance_gain)
-    """
-    coverage_weight = 10.0
-    best_candidate = None
-    best_score = -1.0
-    needed_contests = [
-        contest for contest, need in contests_needing_ballots.items() if need > 0
-    ]
-
-    if not needed_contests:
-        return None
-
-    for style_sig, rows in common_styles.items():
-        # Avoid borrowing from styles that would become rare
-        if len(rows) <= min_ballots:
-            continue
-
-        for idx, row in enumerate(rows):
-            if not row:
-                continue
-            cvr_num = row[0].strip()
-            if cvr_num and cvr_num in aggregation_cvr_numbers:
-                continue
-
-            contests_for_row = determine_contests_for_row(
-                row, needed_contests, contest_to_columns
-            )
-            if not contests_for_row:
-                continue
-
-            coverage = len(contests_for_row)
-            imbalance_gain = 0.0
-            for contest_name in contests_for_row:
-                imbalance_gain += compute_imbalance_gain_for_ballot(
-                    contest_name, row, contest_choice_counts, contest_choice_meta
-                )
-
-            score = coverage_weight * coverage + imbalance_gain
-            if score > best_score:
-                best_score = score
-                best_candidate = (style_sig, idx, row, contests_for_row, imbalance_gain)
-
-    return best_candidate
-
-
-def analyze_styles(
-    all_rows: List[List[str]],
-    contests: List[str],
-    choices: List[str],
-    headerlen: int = 8,
-    stylecol: int = 6,
-    min_ballots: int = 10,
-    summarize: bool = False,
-    ballot_type_idx: Optional[int] = None,
-) -> Dict[str, Any]:
-    """
-    Analyze styles in the CVR file.
-
-    Computes descriptive style names based on contest patterns and checks for leakage.
-
-    Args:
-        all_rows: All data rows from CVR
-        contests: Contest names row
-        choices: Choice names row
-        headerlen: Number of header columns
-        stylecol: Index of style column
-        min_ballots: Minimum ballots per style
-        summarize: Whether to include detailed summaries
-
-    Returns:
-        Dictionary with analysis results including leakage warnings
-    """
-    # Group ballots by contest pattern (which contests appear)
-    pattern_to_rows: Dict[str, List[List[str]]] = defaultdict(list)
-    cvr_style_to_rows: Dict[str, List[List[str]]] = defaultdict(list)
-
-    for row in all_rows:
-        # Compute contest pattern
-        contest_pattern = compute_contest_pattern(row, contests, headerlen)
-        pattern_to_rows[contest_pattern].append(row)
-
-        # Track CVR style name
-        if stylecol > 0:
-            cvr_style = row[stylecol].strip()
-            cvr_style_to_rows[cvr_style].append(row)
-
-    # Generate descriptive style names for each contest pattern
-    pattern_to_descriptive: Dict[str, str] = {}
-    style_counter = 1
-    for pattern in sorted(pattern_to_rows.keys()):
-        ballot_count = len(pattern_to_rows[pattern])
-        descriptive_name = compute_descriptive_style_name(
-            pattern, ballot_count, style_counter, min_ballots
-        )
-        pattern_to_descriptive[pattern] = descriptive_name
-        style_counter += 1
-
-    # Check for leakage: different CVR style names or BallotTypes for same contest pattern
-    leakage_warnings = []
-    pattern_to_cvr_styles: Dict[str, set] = defaultdict(set)
-    pattern_to_ballot_types: Dict[str, set] = defaultdict(set)
-
-    for row in all_rows:
-        contest_pattern = compute_contest_pattern(row, contests, headerlen)
-        if stylecol > 0:
-            cvr_style = row[stylecol].strip()
-            pattern_to_cvr_styles[contest_pattern].add(cvr_style)
-
-        # Check BallotType column if known
-        if ballot_type_idx is not None and len(row) > ballot_type_idx:
-            ballot_type = row[ballot_type_idx].strip()
-            if ballot_type:  # Only track non-empty BallotTypes
-                pattern_to_ballot_types[contest_pattern].add(ballot_type)
-
-    for pattern, cvr_styles in pattern_to_cvr_styles.items():
-        if len(cvr_styles) > 1:
-            descriptive_name = pattern_to_descriptive[pattern]
-            leakage_warnings.append(
-                f"Leakage detected: Contest pattern '{pattern}' (descriptive style '{descriptive_name}') "
-                f"has {len(cvr_styles)} different CVR style names: {sorted(cvr_styles)}. "
-                f"This may reveal additional information about voters."
-            )
-
-    # Check if BallotType varies for same contest pattern
-    if ballot_type_idx is not None:
-        for pattern, ballot_types in pattern_to_ballot_types.items():
-            if len(ballot_types) > 1:
-                descriptive_name = pattern_to_descriptive[pattern]
-                leakage_warnings.append(
-                    f"Warning: Contest pattern '{pattern}' (descriptive style '{descriptive_name}') "
-                    f"has {len(ballot_types)} different BallotType values: {sorted(ballot_types)}. "
-                    f"BallotType is preserved in output - ensure it doesn't reveal identifying information."
-                )
-
-    # Build mapping from CVR style to descriptive style
-    cvr_to_descriptive: Dict[str, str] = {}
-    cvr_to_ballot_type: Dict[str, set] = defaultdict(set)
-    for cvr_style, rows in cvr_style_to_rows.items():
-        if rows:
-            pattern = compute_contest_pattern(rows[0], contests, headerlen)
-            cvr_to_descriptive[cvr_style] = pattern_to_descriptive[pattern]
-            # Track BallotType values for this CVR style
-            if ballot_type_idx is not None:
-                for row in rows:
-                    if len(row) > ballot_type_idx:
-                        ballot_type = row[ballot_type_idx].strip()
-                        if ballot_type:
-                            cvr_to_ballot_type[cvr_style].add(ballot_type)
-
-    result = {
-        "pattern_to_descriptive": pattern_to_descriptive,
-        "cvr_to_descriptive": cvr_to_descriptive,
-        "cvr_to_ballot_type": dict(cvr_to_ballot_type),
-        "leakage_warnings": leakage_warnings,
-        "pattern_to_rows": pattern_to_rows,
-    }
-
-    # Optional summary
-    if summarize:
-        summary = generate_summary(
-            all_rows,
-            contests,
-            choices,
-            pattern_to_rows,
-            pattern_to_descriptive,
-            headerlen,
-        )
-        result["summary"] = summary
-
-    return result
-
-
-def generate_summary(
-    all_rows: List[List[str]],
-    contests: List[str],
-    choices: List[str],
-    pattern_to_rows: Dict[str, List[List[str]]],
-    pattern_to_descriptive: Dict[str, str],
-    headerlen: int,
-) -> Dict[str, Any]:
-    """Generate summary statistics for the CVR."""
-    # Map contest names to column indices
-    contest_to_columns: Dict[str, List[int]] = defaultdict(list)
-    for col_idx in range(headerlen, len(contests)):
-        contest_name = contests[col_idx].strip()
-        if contest_name:
-            contest_to_columns[contest_name].append(col_idx)
-
-    # Calculate totals by contest for each choice
-    contest_totals: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
-    for row in all_rows:
-        for contest_name, col_indices in contest_to_columns.items():
-            for col_idx in col_indices:
-                if col_idx < len(row):
-                    val = row[col_idx].strip()
-                    if val and (val == "1" or val == "0"):
-                        choice_name = (
-                            choices[col_idx].strip()
-                            if col_idx < len(choices)
-                            else f"Choice{col_idx}"
-                        )
-                        if val == "1":
-                            contest_totals[contest_name][choice_name] += 1
-
-    # Calculate ballot counts and probabilities for each style
-    style_stats: Dict[str, Dict[str, Any]] = {}
-    for pattern, rows in pattern_to_rows.items():
-        descriptive_name = pattern_to_descriptive[pattern]
-
-        # Count votes for each choice in this style
-        choice_votes: Dict[str, int] = defaultdict(int)
-        eligible_voters: Dict[str, int] = defaultdict(int)
-
-        for row in rows:
-            for contest_name, col_indices in contest_to_columns.items():
-                # Check if any column for this contest is non-empty (contest appears)
-                contest_appears = any(
-                    col_idx < len(row) and row[col_idx].strip() != ""
-                    for col_idx in col_indices
-                )
-
-                if contest_appears:
-                    eligible_voters[contest_name] += 1
-                    for col_idx in col_indices:
-                        if col_idx < len(row):
-                            val = row[col_idx].strip()
-                            choice_name = (
-                                choices[col_idx].strip()
-                                if col_idx < len(choices)
-                                else f"Choice{col_idx}"
-                            )
-                            if val == "1":
-                                choice_votes[choice_name] += 1
-
-        # Calculate probabilities
-        probabilities: Dict[str, Dict[str, float]] = {}
-        for contest_name in contest_to_columns.keys():
-            if contest_name in eligible_voters and eligible_voters[contest_name] > 0:
-                prob_dict = {}
-                for col_idx in contest_to_columns[contest_name]:
-                    choice_name = (
-                        choices[col_idx].strip()
-                        if col_idx < len(choices)
-                        else f"Choice{col_idx}"
-                    )
-                    votes = choice_votes.get(choice_name, 0)
-                    prob = votes / eligible_voters[contest_name]
-                    prob_dict[choice_name] = prob
-                probabilities[contest_name] = prob_dict
-
-        style_stats[descriptive_name] = {
-            "ballot_count": len(rows),
-            "contest_pattern": pattern,
-            "probabilities": probabilities,
-        }
-
-    return {"contest_totals": dict(contest_totals), "style_stats": style_stats}
-
-
-def anonymize_cvr(
-    input_file: str,
-    output_file: str,
-    min_ballots: int = 10,
-    stylecol: int = 6,
-    headerlen: int = 8,
-    summarize: bool = False,
-) -> Dict[str, int]:
-    """
-    Anonymize a CVR file by aggregating rare styles.
-
-    Reads a CVR file (CSV or Parquet format), identifies styles with fewer than min_ballots,
-    and aggregates them into one or more aggregated rows to meet the threshold.
-
-    Args:
-        input_file: Path to input CVR file (CSV or Parquet format)
-        output_file: Path to output anonymized CVR file
-        min_ballots: Minimum number of ballots required per style (default 10)
-        stylecol: Index of the style column (default 6 for PrecinctPortion)
-        headerlen: Number of header columns before vote data starts (default 8)
-
-    Returns:
-        Dictionary with statistics about the anonymization process
-    """
-    stats = {
-        "total_rows": 0,
-        "rare_styles": 0,
-        "aggregated_rows": 0,
-        "original_styles": 0,
-        "final_styles": 0,
-        "rare_ballots_initial": 0,
-        "ballots_borrowed_for_minimum": 0,
-        "contests_needing_ballots": {},
-        "ballots_added_for_contests": 0,
-        "contests_needing_balancing": [],
-        "ballots_added_for_balancing": 0,
-        "final_aggregate_totals": {},
-        "totals_after_rare_styles": {},
-        "rare_style_counts": [],
-        "contest_ballot_counts": {},
-        "min_ballots": min_ballots,
-        "style_counts": {},
-    }
-
-    # Use context manager to handle Parquet conversion if needed
-    if is_parquet_file(input_file):
-        print("Converting Parquet file to CSV format...", file=sys.stderr)
-
-    ballot_type_idx: Optional[int] = None
-    precinct_portion_idx: Optional[int] = None
-    counting_group_idx: Optional[int] = None
-
-    with TempCVRFile(input_file) as csv_file:
-        # Detect line terminator from input file
-        with open(csv_file, "rb") as f:
-            first_chunk = f.read(1024)
-            if b"\r\n" in first_chunk:
-                lineterminator = "\r\n"
-            elif b"\n" in first_chunk:
-                lineterminator = "\n"
-            elif b"\r" in first_chunk:
-                lineterminator = "\r"
-            else:
-                lineterminator = "\n"  # Default
-
-        # Read input file
-        with open(csv_file, "r", encoding="utf-8") as f:
-            reader = csv.reader(f)
-            version = next(reader)
-            contests = next(reader)
-            choices = next(reader)
-            headers = next(reader)
-            for idx, header_name in enumerate(headers):
-                if header_name.strip().lower() == "ballottype":
-                    ballot_type_idx = idx
-                elif header_name.strip().lower() == "precinctportion":
-                    precinct_portion_idx = idx
-                elif header_name.strip().lower() == "countinggroup":
-                    counting_group_idx = idx
-
-            if headerlen >= len(contests):
+            if self.headerlen == 0:
                 raise ValueError(
-                    f"No vote columns found: headerlen={headerlen} but contests row "
-                    f"has only {len(contests)} columns."
+                    "Could not auto-detect headerlen: no empty cells at the "
+                    "start of the contests row."
                 )
 
-            if stylecol > 0 and stylecol >= headerlen:
-                raise ValueError(
-                    f"Style column {stylecol} is not within the header: headerlen={headerlen}."
-                )
+        # Locate the special columns by name (case-insensitive).
+        for idx, name in enumerate(self.headers):
+            lower = name.strip().lower()
+            if lower == "ballottype":
+                self.ballot_type_idx = idx
+            elif lower == "precinctportion":
+                self.precinct_portion_idx = idx
+            elif lower == "countinggroup":
+                self.counting_group_idx = idx
 
-            # Read all data rows
-            all_rows = [row for row in reader if row]  # drop empty rows (CSV artifact)
-            stats["total_rows"] = len(all_rows)
-
-    # Validate that all rows have the same number of columns and enough for vote data.
-    if all_rows:
-        expected_cols = len(all_rows[0])
-        for row_num, row in enumerate(all_rows, start=5):  # 4 header rows precede data
-            if len(row) != expected_cols:
-                raise ValueError(
-                    f"Malformed CVR: row {row_num} has {len(row)} columns "
-                    f"but expected {expected_cols} (same as row 5)."
-                )
-        if expected_cols <= headerlen:
+    def _validate(self) -> None:
+        """Check that the file structure is usable."""
+        if self.headerlen >= len(self.contests):
             raise ValueError(
-                f"Malformed CVR: rows have {expected_cols} columns "
-                f"but headerlen={headerlen} leaves no vote columns."
+                f"No vote columns found: headerlen={self.headerlen} but "
+                f"contests row has only {len(self.contests)} columns."
             )
-
-    # Count ballots per original CVR style
-    style_counts: Dict[str, int] = defaultdict(int)
-    if stylecol > 0:
-        for row in all_rows:
-            style_value = row[stylecol].strip()
-            if style_value:
-                style_counts[style_value] += 1
-    stats["style_counts"] = dict(style_counts)
-
-    # Analyze styles for leakage detection
-    style_analysis = analyze_styles(
-        all_rows,
-        contests,
-        choices,
-        headerlen,
-        stylecol,
-        min_ballots,
-        summarize,
-        ballot_type_idx=ballot_type_idx,
-    )
-
-    # Report leakage warnings
-    if style_analysis["leakage_warnings"]:
-        print("Warning: Potential information leakage detected:", file=sys.stderr)
-        for warning in style_analysis["leakage_warnings"]:
-            print(f"  {warning}", file=sys.stderr)
-
-    # Print style mapping
-    if style_analysis["cvr_to_descriptive"]:
-        print("\nStyle mapping (CVR style -> Descriptive style):")
-        cvr_to_ballot_type = style_analysis.get("cvr_to_ballot_type", {})
-        for cvr_style in sorted(style_analysis["cvr_to_descriptive"].keys()):
-            descriptive = style_analysis["cvr_to_descriptive"][cvr_style]
-            count = style_counts.get(cvr_style, 0)
-            ballot_label = "ballots" if count != 1 else "ballot"
-            ballot_type_info = ""
-            if cvr_style in cvr_to_ballot_type:
-                ballot_types = sorted(cvr_to_ballot_type[cvr_style])
-                if len(ballot_types) == 1:
-                    ballot_type_info = f", BallotType={ballot_types[0]}"
-                else:
-                    ballot_type_info = f", BallotType={','.join(ballot_types)}"
-            print(
-                f"  {cvr_style} ({count} {ballot_label}{ballot_type_info}) -> {descriptive}"
+        if self.named_style_col is not None and self.named_style_col >= self.headerlen:
+            raise ValueError(
+                f"Named style column {self.named_style_col} must be within "
+                f"the header columns (headerlen={self.headerlen})."
             )
-
-    # Print summary if requested
-    if summarize and "summary" in style_analysis:
-        summary = style_analysis["summary"]
-        print("\n=== CVR Summary ===")
-
-        print("\nTotals by contest:")
-        for contest_name, choice_totals in summary["contest_totals"].items():
-            print(f"  {contest_name}:")
-            for choice_name, count in sorted(choice_totals.items()):
-                print(f"    {choice_name}: {count}")
-
-        print("\nStyle statistics:")
-        for style_name, style_info in sorted(summary["style_stats"].items()):
-            print(
-                f"  {style_name} ({style_info['ballot_count']} ballots, pattern: {style_info['contest_pattern']}):"
-            )
-            for contest_name, probs in style_info["probabilities"].items():
-                print(f"    {contest_name}:")
-                for choice_name, prob in sorted(probs.items()):
-                    print(f"      {choice_name}: {prob:.4f}")
-
-    # Group rows by style signature
-    style_groups: Dict[str, List[List[str]]] = defaultdict(list)
-    for row in all_rows:
-        style_sig = compute_contest_pattern(row, contests, headerlen)
-        style_groups[style_sig].append(row)
-
-    stats["original_styles"] = len(style_groups)
-
-    # Identify rare and common styles
-    rare_styles: Dict[str, List[List[str]]] = {}
-    common_styles: Dict[str, List[List[str]]] = {}
-    pattern_to_descriptive = style_analysis.get("pattern_to_descriptive", {})
-
-    for style_sig, rows in style_groups.items():
-        if not rows:
-            continue
-        descriptive_name = pattern_to_descriptive[style_sig]
-
-        if len(rows) < min_ballots:
-            rare_styles[style_sig] = rows
-            stats["rare_styles"] += len(rows)
-            style_name_counts: Dict[str, int] = defaultdict(int)
-            style_ballot_types: Dict[str, set] = defaultdict(set)
-            for row in rows:
-                style_value = None
-                if stylecol > 0:
-                    style_value = row[stylecol].strip()
-                    if style_value:
-                        style_name_counts[style_value] += 1
-                if ballot_type_idx is not None and len(row) > ballot_type_idx:
-                    ballot_type = row[ballot_type_idx].strip()
-                    if ballot_type and style_value:
-                        style_ballot_types[style_value].add(ballot_type)
-            stats["rare_style_counts"].append(
-                {
-                    "descriptive_name": descriptive_name,
-                    "ballot_count": len(rows),
-                    "original_styles": sorted(style_name_counts.items()),
-                    "ballot_types": {
-                        style: sorted(types)
-                        for style, types in style_ballot_types.items()
-                    },
-                }
-            )
-        else:
-            common_styles[style_sig] = rows
-
-    # NEW APPROACH: Combine all rare styles into one aggregation
-    # Focus on balance (avoid unanimous patterns) and minimums per contest
-
-    # Count total rare ballots
-    total_rare_ballots = sum(len(rows) for rows in rare_styles.values())
-
-    # No rare ballots - nothing to aggregate
-    if total_rare_ballots == 0:
-        row_groups = []
-    else:
-        # Step 1: Collect ALL rare ballots into one list
-        all_rare_ballots = []
-        for rows in rare_styles.values():
-            all_rare_ballots.extend(rows)
-
-        stats["rare_ballots_initial"] = len(all_rare_ballots)
-
-        # Calculate totals after including all rare styles
-        temp_agg_after_rare = aggregate_votes(
-            all_rare_ballots,
-            headerlen,
-            aggregate_id="AGGREGATED-TEMP",
-            ballot_type_idx=ballot_type_idx,
-            precinct_portion_idx=precinct_portion_idx,
-            counting_group_idx=counting_group_idx,
-        )
-        stats["totals_after_rare_styles"] = tally_aggregated_votes_by_contest(
-            temp_agg_after_rare, contests, choices, headerlen
-        )
-
-        # Step 2: If we don't have enough ballots, borrow from common styles to reach min_ballots
-        if len(all_rare_ballots) < min_ballots:
-            needed = min_ballots - len(all_rare_ballots)
-            # Borrow ballots from the largest common style
-            if common_styles:
-                # Sort by size (largest first)
-                sorted_common = sorted(
-                    common_styles.items(), key=lambda x: len(x[1]), reverse=True
-                )
-                style_sig, common_rows = sorted_common[0]
-
-                # Calculate how many we can borrow
-                remaining_after_borrow = len(common_rows) - needed
-                if remaining_after_borrow < min_ballots and remaining_after_borrow > 0:
-                    # Take all ballots to avoid leaving a rare-looking style
-                    borrowed = common_rows[:]
-                    common_styles[style_sig] = []
-                    if len(common_styles[style_sig]) == 0:
-                        del common_styles[style_sig]
-                else:
-                    # Borrow only what we need
-                    borrowed = common_rows[:needed]
-                    common_styles[style_sig] = common_rows[needed:]
-                    if len(common_styles[style_sig]) < min_ballots:
-                        del common_styles[style_sig]
-
-                all_rare_ballots.extend(borrowed)
-                stats["ballots_borrowed_for_minimum"] = len(borrowed)
-            else:
-                # No common styles to borrow from
+        # Every ballot row must be exactly as wide as the contests row.
+        expected_cols = len(self.contests)
+        for i, ballot in enumerate(self.ballots):
+            if len(ballot) != expected_cols:
                 raise ValueError(
-                    f"Cannot anonymize: {total_rare_ballots} rare ballot(s) found, "
-                    f"but cannot create aggregate with at least {min_ballots} ballots. "
-                    f"No common styles available to borrow from."
+                    f"Row {i + 5} has {len(ballot)} columns but contests row "
+                    f"has {expected_cols}."
                 )
 
-        # Step 3: Ensure at least min_ballots per contest in the aggregation
-        rare_contests: Set[str] = set()
-        # Map contest names to column indices
-        contest_to_columns = defaultdict(set)
-        for col_idx in range(headerlen, len(contests)):
-            contest_name = contests[col_idx].strip()
-            if contest_name:
-                contest_to_columns[contest_name].add(col_idx)
+    def _build_contest_map(self) -> None:
+        """Build the contest name -> column indices mapping and ordered contest list."""
+        mapping: Dict[str, List[int]] = defaultdict(list)
+        for col_idx in range(self.headerlen, len(self.contests)):
+            name = self.contests[col_idx].strip()
+            if not name:
+                raise ValueError(
+                    f"Contest row column {col_idx} is empty; expected a contest name."
+                )
+            if name not in mapping:
+                self.contest_names.append(name)
+            mapping[name].append(col_idx)
+        self.contest_to_columns = dict(mapping)
 
-        # Map contest names to choice names per column
-        contest_choice_meta: Dict[str, Dict[int, str]] = {}
-        for contest_name, col_indices in contest_to_columns.items():
-            choice_map: Dict[int, str] = {}
+    def _validate_ballot_contents(self) -> None:
+        """
+        Verify that for each contest on each ballot, choice columns are either
+        all empty (contest absent) or all non-empty (contest present).
+        Mixed state indicates a malformed ballot row.
+        """
+        for i, ballot in enumerate(self.ballots):
+            for contest_name, col_indices in self.contest_to_columns.items():
+                values = [ballot[col_idx].strip() for col_idx in col_indices]
+                empty_flags = [v == "" for v in values]
+                if any(empty_flags) and not all(empty_flags):
+                    raise ValueError(
+                        f"Row {i + 5}: contest '{contest_name}' has mixed "
+                        f"empty/non-empty choice columns."
+                    )
+
+    def _style_for_ballot(self, ballot: List[str]) -> str:
+        """
+        Compute the style string for one ballot.
+
+        Returns a string of '1' and '0' characters, one per contest in
+        contest_names order.  '1' means the contest is present on the ballot.
+        """
+        parts = []
+        for contest_name in self.contest_names:
+            col_indices = self.contest_to_columns[contest_name]
+            present = False
             for col_idx in col_indices:
-                choice_name = ""
-                if col_idx < len(choices):
-                    choice_name = choices[col_idx].strip()
-                if not choice_name:
-                    choice_name = f"Choice{col_idx}"
-                choice_map[col_idx] = choice_name
-            contest_choice_meta[contest_name] = choice_map
+                if ballot[col_idx].strip() != "":
+                    present = True
+                    break
+            parts.append("1" if present else "0")
+        return "".join(parts)
 
-        contest_choice_counts: Dict[str, Dict[str, int]] = {
-            contest_name: {} for contest_name in contest_choice_meta.keys()
-        }
-        for row in all_rare_ballots:
-            update_choice_counts_from_row(
-                row, contest_choice_counts, contest_choice_meta
-            )
+    def _group_ballots(self) -> None:
+        """
+        Iterate all ballots once and build every grouping needed for
+        analysis and redaction.
+        """
+        by_style: Dict[str, List[List[str]]] = defaultdict(list)
+        by_named_style: Dict[str, List[List[str]]] = defaultdict(list)
+        by_ballot_type: Dict[str, List[List[str]]] = defaultdict(list)
+        by_precinct: Dict[str, List[List[str]]] = defaultdict(list)
+        named_styles_by_style: Dict[str, Set[str]] = defaultdict(set)
+        ballot_types_by_style: Dict[str, Set[str]] = defaultdict(set)
 
-        contest_names_list = list(contest_to_columns.keys())
-        contest_ballot_counts: Dict[str, int] = defaultdict(int)
-        contest_ballot_vote_counts: Dict[str, int] = defaultdict(int)
-        aggregation_cvr_numbers = set()
-        for row in all_rare_ballots:
-            cvr_num = row[0].strip()
-            if cvr_num:
-                aggregation_cvr_numbers.add(cvr_num)
-            update_contest_presence_counts(
-                row,
-                contest_names_list,
-                contest_to_columns,
-                contest_ballot_counts,
-                contest_ballot_vote_counts,
-            )
+        for ballot in self.ballots:
+            style = self._style_for_ballot(ballot)
+            by_style[style].append(ballot)
 
-        rare_contests = {
-            contest for contest, count in contest_ballot_counts.items() if count > 0
-        }
+            if self.named_style_col is not None:
+                named_style = ballot[self.named_style_col].strip()
+                by_named_style[named_style].append(ballot)
+                named_styles_by_style[style].add(named_style)
 
-        # Find contests that need more ballots (only contests appearing on rare ballots)
-        contests_needing_ballots = {}
-        for contest_name, count in contest_ballot_counts.items():
-            if contest_name not in rare_contests:
-                continue
-            if count < min_ballots:
-                needed = min_ballots - count
-                contests_needing_ballots[contest_name] = needed
+            if self.ballot_type_idx is not None:
+                ballot_type = ballot[self.ballot_type_idx].strip()
+                by_ballot_type[ballot_type].append(ballot)
+                ballot_types_by_style[style].add(ballot_type)
 
-        stats["contest_ballot_counts_after_rare"] = dict(contest_ballot_counts)
-        stats["contest_ballot_vote_counts_after_rare"] = dict(
-            contest_ballot_vote_counts
-        )
-        stats["target_contests"] = sorted(rare_contests)
+            if self.redact_on_precinct and self.precinct_portion_idx is not None:
+                precinct = ballot[self.precinct_portion_idx].strip()
+                by_precinct[precinct].append(ballot)
 
-        stats["contest_ballot_counts"] = dict(contest_ballot_counts)
+        self.ballots_by_style = dict(by_style)
+        self.ballots_by_named_style = dict(by_named_style)
+        self.ballots_by_ballot_type = dict(by_ballot_type)
+        self.ballots_by_precinct = dict(by_precinct)
+        self.named_styles_by_style = dict(named_styles_by_style)
+        self.ballot_types_by_style = dict(ballot_types_by_style)
 
-        stats["contests_needing_ballots"] = dict(contests_needing_ballots)
 
-        # Add ballots for contests that need them, prioritizing multi-contest coverage and balance
-        additional_ballots: List[List[str]] = []
+# ---------------------------------------------------------------------------
+# RedactionNeeds
+# ---------------------------------------------------------------------------
 
-        while contests_needing_ballots:
-            candidate = select_balancing_ballot(
-                common_styles,
-                contests_needing_ballots,
-                contest_to_columns,
-                contest_choice_counts,
-                contest_choice_meta,
-                aggregation_cvr_numbers,
-                min_ballots,
-            )
-            if candidate is None:
-                break
 
-            style_sig, row_idx, row, contests_for_row, _ = candidate
-            additional_ballots.append(row)
-            all_rare_ballots.append(row)
-            cvr_num = row[0].strip()
-            if cvr_num:
-                aggregation_cvr_numbers.add(cvr_num)
+class RedactionNeeds:
+    """
+    Describes what the CVR requires before it can be safely published.
 
-            update_contest_presence_counts(
-                row,
-                contest_names_list,
-                contest_to_columns,
-                contest_ballot_counts,
-                contest_ballot_vote_counts,
-            )
+    Populated by check_redaction_needs().  The redaction logic (to be added
+    later) will read this to decide what work to do.
 
-            update_choice_counts_from_row(
-                row, contest_choice_counts, contest_choice_meta
-            )
+    Rare styles and rare precincts both require the same kind of treatment:
+    ballots must be aggregated so no individual voter can be identified.
+    Near-unanimity checking (Rule 7) applies to both and will be added here
+    when that phase is implemented.
+    """
 
-            # Update remaining needs for contests we were targeting
-            for contest_name in contests_for_row:
-                if contest_name in contests_needing_ballots:
-                    contests_needing_ballots[contest_name] -= 1
-                    if contests_needing_ballots[contest_name] <= 0:
-                        del contests_needing_ballots[contest_name]
+    def __init__(self) -> None:
+        # Styles with too few ballots.
+        # Key: style string.  Value: ballot count.
+        self.rare_styles: Dict[str, int] = {}
 
-            # Remove the borrowed ballot from the common styles pool
-            if style_sig in common_styles:
-                rows_list = common_styles[style_sig]
-                if 0 <= row_idx < len(rows_list):
-                    rows_list.pop(row_idx)
-                if len(rows_list) < min_ballots:
-                    del common_styles[style_sig]
+        # Precincts with too few ballots.
+        # Only populated when --redact-on-precinct is requested.
+        # Key: PrecinctPortion value.  Value: ballot count.
+        self.rare_precincts: Dict[str, int] = {}
 
-        # Fallback: if contests still need ballots, use per-contest search
-        if contests_needing_ballots:
-            for contest_name, needed in list(contests_needing_ballots.items()):
-                if needed <= 0:
-                    continue
-                found = find_ballots_with_contest(
-                    contest_name,
-                    common_styles,
-                    contests,
-                    headerlen,
-                    min_ballots,
-                    needed_count=needed,
-                    exclude_cvr_numbers=aggregation_cvr_numbers,
+        # Human-readable leakage warnings.  Leakage is reported but not corrected.
+        self.leakage_warnings: List[str] = []
+
+    def needs_redaction(self) -> bool:
+        """Return True if any redaction work is required."""
+        return len(self.rare_styles) > 0 or len(self.rare_precincts) > 0
+
+
+# ---------------------------------------------------------------------------
+# check_redaction_needs
+# ---------------------------------------------------------------------------
+
+
+def check_redaction_needs(
+    db: CvrDatabase,
+    min_ballots: int,
+) -> RedactionNeeds:
+    """
+    Examine the database and return a description of what needs redacting.
+
+    Args:
+        db:          The CVR database to examine.
+        min_ballots: Minimum ballots required per style or precinct.
+
+    Returns:
+        A RedactionNeeds object describing what must be done.
+    """
+    needs = RedactionNeeds()
+
+    # Check for rare styles (Rule 2).
+    for style, ballots in db.ballots_by_style.items():
+        if len(ballots) < min_ballots:
+            needs.rare_styles[style] = len(ballots)
+
+    # Check for rare precincts.
+    # ballots_by_precinct is only populated when --redact-on-precinct was set.
+    for precinct, ballots in db.ballots_by_precinct.items():
+        if len(ballots) < min_ballots:
+            needs.rare_precincts[precinct] = len(ballots)
+
+    # Check for named_style leakage (Rule 10).
+    # Leakage: more than one named_style maps to the same contest pattern.
+    if db.named_style_col is not None:
+        for style, named_styles in db.named_styles_by_style.items():
+            if len(named_styles) > 1:
+                names = ", ".join(sorted(named_styles))
+                needs.leakage_warnings.append(
+                    f"Leakage: named styles [{names}] all share the same contest pattern"
                 )
-                if not found:
-                    continue
-                for row in found:
-                    additional_ballots.append(row)
-                    all_rare_ballots.append(row)
-                    update_choice_counts_from_row(
-                        row, contest_choice_counts, contest_choice_meta
-                    )
-                    update_contest_presence_counts(
-                        row,
-                        contest_names_list,
-                        contest_to_columns,
-                        contest_ballot_counts,
-                        contest_ballot_vote_counts,
-                    )
-                    cvr_num = row[0].strip()
-                    if cvr_num:
-                        aggregation_cvr_numbers.add(cvr_num)
-                contests_needing_ballots[contest_name] -= len(found)
-                if contests_needing_ballots[contest_name] <= 0:
-                    del contests_needing_ballots[contest_name]
 
-        stats["ballots_added_for_contests"] = len(additional_ballots)
+    # Check for ballot_type leakage (Rule 10).
+    # Leakage: more than one ballot_type maps to the same contest pattern.
+    if db.ballot_type_idx is not None:
+        for style, ballot_types in db.ballot_types_by_style.items():
+            if len(ballot_types) > 1:
+                types = ", ".join(sorted(ballot_types))
+                needs.leakage_warnings.append(
+                    f"Leakage: ballot types [{types}] all share the same contest pattern"
+                )
 
-        # Update common_styles to remove borrowed ballots
-        if additional_ballots:
-            additional_cvr_numbers = set()
-            for row in additional_ballots:
-                cvr_num = row[0].strip()
-                if cvr_num:
-                    additional_cvr_numbers.add(cvr_num)
-
-            # Remove borrowed ballots from common_styles
-            for style_sig in list(common_styles.keys()):
-                remaining_rows = [
-                    row
-                    for row in common_styles[style_sig]
-                    if row[0].strip() not in additional_cvr_numbers
-                ]
-                if len(remaining_rows) < min_ballots:
-                    del common_styles[style_sig]
-                else:
-                    common_styles[style_sig] = remaining_rows
-
-        # Step 4: Aggregate all rare ballots into one row
-        # Create a single row group
-        row_groups = [all_rare_ballots]
-
-        # Step 5: Check for unanimous/near-unanimous patterns and add contrasting votes
-        # First, create a temporary aggregated row to analyze
-        temp_aggregated = aggregate_votes(
-            all_rare_ballots,
-            headerlen,
-            aggregate_id="AGGREGATED-TEMP",
-            ballot_type_idx=ballot_type_idx,
-            precinct_portion_idx=precinct_portion_idx,
-            counting_group_idx=counting_group_idx,
-        )
-        contest_totals = tally_aggregated_votes_by_contest(
-            temp_aggregated, contests, choices, headerlen
-        )
-        total_ballots_in_agg = len(all_rare_ballots)
-        problematic_contests = [
-            entry
-            for entry in check_unanimous_patterns(contest_totals, total_ballots_in_agg)
-            if entry[0] in rare_contests
-        ]
-
-        # Track which contests needed balancing
-        if problematic_contests:
-            stats["contests_needing_balancing"] = [
-                (contest_name, winning_choice)
-                for contest_name, winning_choice, _, _ in problematic_contests
-            ]
-
-        # If we have problematic contests, add contrasting votes
-        if problematic_contests:
-            contrasting_ballots = find_contrasting_ballots_multi(
-                problematic_contests,
-                common_styles,
-                contests,
-                choices,
-                headerlen,
-                min_ballots,
-            )
-            if contrasting_ballots:
-                all_rare_ballots.extend(contrasting_ballots)
-                stats["ballots_added_for_balancing"] = len(contrasting_ballots)
-                contest_names_list = list(contest_to_columns.keys())
-                # Update common_styles to remove borrowed ballots
-                contrasting_cvr_numbers = set()
-                for row in contrasting_ballots:
-                    cvr_num = row[0].strip()
-                    if cvr_num:
-                        contrasting_cvr_numbers.add(cvr_num)
-                    update_choice_counts_from_row(
-                        row, contest_choice_counts, contest_choice_meta
-                    )
-                    update_contest_presence_counts(
-                        row,
-                        contest_names_list,
-                        contest_to_columns,
-                        contest_ballot_counts,
-                        contest_ballot_vote_counts,
-                    )
-
-                for style_sig in list(common_styles.keys()):
-                    remaining_rows = [
-                        row
-                        for row in common_styles[style_sig]
-                        if row[0].strip() not in contrasting_cvr_numbers
-                    ]
-                    if len(remaining_rows) < min_ballots:
-                        del common_styles[style_sig]
-                    else:
-                        common_styles[style_sig] = remaining_rows
-
-                # Update row_groups with the new ballots
-                row_groups[0] = all_rare_ballots
-
-        stats["final_contest_ballot_counts"] = dict(contest_ballot_counts)
-        stats["final_contest_vote_counts"] = dict(contest_ballot_vote_counts)
-
-    # Create aggregated rows from the row groups
-    aggregated_groups = []
-    for i, group in enumerate(row_groups):
-        agg_id = f"AGGREGATED-{i + 1}"
-        aggregated_row = aggregate_votes(
-            group,
-            headerlen,
-            aggregate_id=agg_id,
-            ballot_type_idx=ballot_type_idx,
-            precinct_portion_idx=precinct_portion_idx,
-            counting_group_idx=counting_group_idx,
-        )
-        # Note: CountingGroup and PrecinctPortion are already blanked in aggregate_votes
-        # BallotType is set to "AGGREGATED" for aggregated rows
-        aggregated_groups.append(aggregated_row)
-
-        # Calculate final totals for this aggregate
-        stats["final_aggregate_totals"] = tally_aggregated_votes_by_contest(
-            aggregated_row, contests, choices, headerlen
-        )
-
-    stats["aggregated_rows"] = len(aggregated_groups)
-    stats["final_styles"] = len(common_styles) + len(aggregated_groups)
-
-    # Build set of all CvrNumbers that are in aggregates (should be excluded from output)
-    # Use CvrNumber (column 0) as the unique identifier for matching rows
-    aggregated_cvr_numbers = set()
-    if row_groups:
-        # Create a set of all CvrNumbers that will be in aggregates
-        for group in row_groups:
-            for row in group:
-                cvr_num = row[0].strip()
-                if cvr_num and not cvr_num.startswith("AGGREGATED-"):
-                    aggregated_cvr_numbers.add(cvr_num)
-
-    # Collect all output rows
-    output_rows = []
-
-    # Add rows that are NOT in any aggregation
-    # Blank CountingGroup and PrecinctPortion to avoid revealing additional information
-    # Preserve BallotType (it should only reflect contest pattern, not additional identifying info)
-    for row in all_rows:
-        cvr_num = row[0].strip()
-        # Skip if this row is in an aggregation
-        if cvr_num not in aggregated_cvr_numbers:
-            # Create a copy to avoid modifying the original
-            output_row = row.copy()
-            # Blank CountingGroup and PrecinctPortion if they exist
-            # Preserve BallotType - it should only reflect contest pattern
-            if counting_group_idx is not None and len(output_row) > counting_group_idx:
-                output_row[counting_group_idx] = ""  # CountingGroup
-            if (
-                precinct_portion_idx is not None
-                and len(output_row) > precinct_portion_idx
-            ):
-                output_row[precinct_portion_idx] = ""  # PrecinctPortion
-            # BallotType is preserved as-is (not blanked for non-aggregated rows)
-            output_rows.append(output_row)
-
-    # Add aggregated rows
-    output_rows.extend(aggregated_groups)
-
-    # Sort rows numerically by CvrNumber (column 0)
-    # Handle both numeric CvrNumbers and "AGGREGATED-N" strings
-    def sort_key(row):
-        if not row:
-            return (1, "")  # Empty rows go to end
-        cvr_num = row[0].strip()
-        # Check if it's an aggregated row
-        if cvr_num.startswith("AGGREGATED-"):
-            # Extract number from "AGGREGATED-N" and put at very end
-            try:
-                num = int(cvr_num.split("-")[1])
-                return (2, num)  # 2 means aggregated, sort by number
-            except (ValueError, IndexError):
-                return (3, cvr_num)  # Invalid format goes last
-        # Try to parse as integer
-        try:
-            return (0, int(cvr_num))  # 0 means numeric, sort numerically
-        except ValueError:
-            # Non-numeric, sort as string after numeric values
-            return (1, cvr_num)
-
-    output_rows.sort(key=sort_key)
-
-    # Write output file with sorted rows, preserving original line terminator
-    with open(output_file, "w", encoding="utf-8", newline="") as f:
-        writer = csv.writer(f, lineterminator=lineterminator)
-        writer.writerow(version)
-        writer.writerow(contests)
-        writer.writerow(choices)
-        writer.writerow(headers)
-
-        # Write sorted rows
-        for row in output_rows:
-            writer.writerow(row)
-
-    # Verify that tallies match (required check before delivering redacted CVR)
-    match, details = verify_tally_match(input_file, output_file, headerlen)
-    if not match:
-        print(
-            "ERROR: Vote tallies do not match between original and anonymized CVR!",
-            file=sys.stderr,
-        )
-        print("Mismatches:", file=sys.stderr)
-        for mismatch in details["mismatches"]:
-            print(
-                f"  Contest '{mismatch['contest']}', Choice '{mismatch['choice']}': "
-                f"Original={mismatch['original']}, Anonymized={mismatch['anonymized']}, "
-                f"Difference={mismatch['difference']}",
-                file=sys.stderr,
-            )
-        raise ValueError(
-            "Anonymization failed: vote tallies do not match. "
-            "This indicates a bug in the aggregation logic. "
-            "The redacted CVR cannot be delivered."
-        )
-    # Verification passed - tallies match
-
-    return stats
+    return needs
 
 
-def main():
-    """Command-line interface for CVR anonymization."""
+# ---------------------------------------------------------------------------
+# Argument parsing
+# ---------------------------------------------------------------------------
+
+
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Anonymize CVR files by aggregating rare styles (supports CSV and Parquet formats)",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  python anonymize_cvr.py input.csv output.csv
-  python anonymize_cvr.py input.parquet output.csv
-  python anonymize_cvr.py input.csv output.csv --min-ballots 15
-        """,
+        description=(
+            "Anonymize Cast Vote Records per Colorado C.R.S. 24-72-205.5. "
+            "Ballot styles with fewer than --min-ballots ballots are aggregated "
+            "to protect voter privacy."
+        )
     )
     parser.add_argument(
-        "input_file", help="Input CVR file path (CSV or Parquet format)"
+        "input_file",
+        help="Path to the input CVR file (CSV or Parquet format).",
     )
-    parser.add_argument("output_file", help="Output anonymized CVR file path")
+    parser.add_argument(
+        "output_file",
+        nargs="?",
+        default=None,
+        help=(
+            "Path for the redacted output CVR file. "
+            "Required in redact mode; not needed in --check mode."
+        ),
+    )
+    parser.add_argument(
+        "--check",
+        "-c",
+        action="store_true",
+        help="Check mode: report whether redaction is needed without writing output.",
+    )
+    parser.add_argument(
+        "--redact-on-precinct",
+        action="store_true",
+        help=(
+            "Treat precincts with fewer than --min-ballots ballots as rare "
+            "and aggregate them, instead of simply blanking the PrecinctPortion column."
+        ),
+    )
     parser.add_argument(
         "--min-ballots",
         type=int,
-        default=10,
-        help="Minimum ballots required per style (default: 10)",
+        default=MIN_BALLOTS_DEFAULT,
+        metavar="N",
+        help=f"Minimum ballots required per style or precinct (default: {MIN_BALLOTS_DEFAULT}).",
     )
     parser.add_argument(
-        "--stylecol", type=int, default=0, help="Index of style column (default: 6)"
+        "--headerlen",
+        type=int,
+        default=0,
+        metavar="N",
+        help=(
+            "Number of header columns before vote data begins. "
+            "Auto-detected from the contests row if not specified."
+        ),
     )
     parser.add_argument(
-        "--headerlen", type=int, default=7, help="Number of header columns (default: 8)"
+        "--stylecol",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Column index (0-based) of the named_style field, if present.",
     )
-    parser.add_argument(
-        "--summarize",
-        "-s",
-        action="store_true",
-        help="Print detailed summary of CVR statistics",
-    )
-
     args = parser.parse_args()
+    if not args.check and args.output_file is None:
+        parser.error("output_file is required when not in --check mode.")
+    return args
 
+
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
+
+
+def main() -> None:
+    args = parse_args()
+
+    # Load the CVR file.
     try:
-        stats = anonymize_cvr(
+        db = CvrDatabase(
             args.input_file,
-            args.output_file,
-            args.min_ballots,
-            args.stylecol,
             args.headerlen,
-            args.summarize,
+            args.stylecol,
+            args.redact_on_precinct,
+        )
+    except (ValueError, OSError) as e:
+        print(f"Error reading CVR file: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    # Warn if --redact-on-precinct was requested but no PrecinctPortion column exists.
+    if args.redact_on_precinct and db.precinct_portion_idx is None:
+        print(
+            "Warning: --redact-on-precinct was requested but the CVR has no "
+            "PrecinctPortion column.  The option will have no effect.",
+            file=sys.stderr,
         )
 
-        print("Anonymization complete!")
-        print(f"  Total rows processed: {stats['total_rows']}")
-        print(f"  Original styles: {stats['original_styles']}")
-        if stats.get("rare_style_counts"):
-            print(f"  Rare styles ({len(stats['rare_style_counts'])}):")
-            for entry in sorted(
-                stats["rare_style_counts"], key=lambda x: x["descriptive_name"]
-            ):
-                orig_styles = entry.get("original_styles") or []
-                if orig_styles:
-                    orig_desc = ", ".join(
-                        f"{name} ({count})" for name, count in orig_styles
-                    )
-                else:
-                    orig_desc = "unknown CVR style(s)"
-                ballot_types_info = entry.get("ballot_types", {})
-                ballot_type_str = ""
-                if ballot_types_info:
-                    # Collect all unique BallotType values across styles
-                    all_ballot_types = set()
-                    for types in ballot_types_info.values():
-                        all_ballot_types.update(types)
-                    if all_ballot_types:
-                        ballot_type_str = (
-                            f", BallotType={','.join(sorted(all_ballot_types))}"
-                        )
-                print(
-                    f"    {entry['descriptive_name']}: {entry['ballot_count']} ballot(s) from {orig_desc}{ballot_type_str}"
-                )
-        print(f"  Aggregated rows created: {stats['aggregated_rows']}")
-        print(f"  Final styles: {stats['final_styles']}")
-        print(f"  Output written to: {args.output_file}")
+    # Determine what redaction is needed.
+    needs = check_redaction_needs(db, args.min_ballots)
 
-        # Print aggregation statistics
-        if stats.get("rare_ballots_initial", 0) > 0:
-            print("\n=== Aggregation Statistics ===")
-            print(f"  Initial rare ballots: {stats['rare_ballots_initial']}")
+    # Report leakage warnings (always, in both check and redact mode).
+    for warning in needs.leakage_warnings:
+        print(f"WARNING: {warning}", file=sys.stderr)
 
-            if stats.get("ballots_borrowed_for_minimum", 0) > 0:
+    if args.check:
+        if needs.needs_redaction():
+            print("Redaction needed.")
+            if needs.rare_styles:
+                total_styles = len(db.ballots_by_style)
                 print(
-                    f"  Ballots borrowed to reach minimum: {stats['ballots_borrowed_for_minimum']}"
+                    f"\n  Rare ballot styles "
+                    f"({len(needs.rare_styles)} of {total_styles} total):"
                 )
+                # Sort by ballot count, fewest first.
+                for style, count in sorted(needs.rare_styles.items(), key=lambda item: item[1]):
+                    description = f"{count} ballot(s), {style.count('1')} contest(s)"
+                    # Add ballot type(s) as a human-readable identifier, if available.
+                    ballot_types = db.ballot_types_by_style.get(style, set())
+                    if ballot_types:
+                        types_str = ", ".join(f'"{t}"' for t in sorted(ballot_types))
+                        description += f"  [ballot type: {types_str}]"
+                    print(f"    {description}")
 
-            if stats.get("contests_needing_ballots"):
-                print(
-                    f"  Contests needing additional ballots ({len(stats['contests_needing_ballots'])}):"
-                )
-                contest_counts = stats.get("contest_ballot_counts", {})
-                min_required = stats.get("min_ballots", 10)
-                for contest, needed in sorted(
-                    stats["contests_needing_ballots"].items()
+            if needs.rare_precincts:
+                print(f"\n  Rare precincts ({len(needs.rare_precincts)}):")
+                for precinct, count in sorted(
+                    needs.rare_precincts.items(), key=lambda item: item[1]
                 ):
-                    current = contest_counts.get(contest, 0)
-                    print(
-                        f"    {contest[:60]}: had {current}, needed {needed} more to reach {min_required}"
-                    )
-                print(
-                    f"  Total ballots added for contests: {stats.get('ballots_added_for_contests', 0)}"
-                )
+                    print(f'    "{precinct}": {count} ballot(s)')
+        else:
+            print("No redaction needed.")
+        return
 
-            if stats.get("contests_needing_balancing"):
-                print(
-                    f"  Contests needing balancing ({len(stats['contests_needing_balancing'])}):"
-                )
-                for contest, choice in stats["contests_needing_balancing"]:
-                    print(f"    {contest[:60]}: {choice[:40]}")
-                print(
-                    f"  Total ballots added for balancing: {stats.get('ballots_added_for_balancing', 0)}"
-                )
-
-            total_extra = (
-                stats.get("ballots_borrowed_for_minimum", 0)
-                + stats.get("ballots_added_for_contests", 0)
-                + stats.get("ballots_added_for_balancing", 0)
-            )
-            if total_extra > 0:
-                print(f"  Total extra CVRs added to aggregate: {total_extra}")
-
-            if stats.get("totals_after_rare_styles"):
-                print("\n  Totals after including all rare styles:")
-                eligible_counts_after_rare = stats.get(
-                    "contest_ballot_counts_after_rare", {}
-                )
-                ballots_with_votes_after_rare = stats.get(
-                    "contest_ballot_vote_counts_after_rare", {}
-                )
-                for contest_name, choice_totals in sorted(
-                    stats["totals_after_rare_styles"].items()
-                ):
-                    votes_cast = ballots_with_votes_after_rare.get(contest_name, 0)
-                    eligible = eligible_counts_after_rare.get(contest_name, votes_cast)
-                    undervotes = max(eligible - votes_cast, 0)
-                    print(
-                        f"    {contest_name[:60]}: {eligible} ballot(s) with contest, "
-                        f"{votes_cast} ballot(s) with votes, {undervotes} undervote(s)"
-                    )
-                    for choice, count in sorted(choice_totals.items()):
-                        if count > 0:
-                            print(f"      {choice[:40]}: {count}")
-
-            if stats.get("final_aggregate_totals"):
-                print("\n  Final aggregate totals:")
-                final_contest_counts = stats.get("final_contest_ballot_counts", {})
-                final_contest_vote_counts = stats.get("final_contest_vote_counts", {})
-                for contest_name, choice_totals in sorted(
-                    stats["final_aggregate_totals"].items()
-                ):
-                    votes_cast = final_contest_vote_counts.get(contest_name, 0)
-                    eligible = final_contest_counts.get(contest_name, votes_cast)
-                    undervotes = max(eligible - votes_cast, 0)
-                    print(
-                        f"    {contest_name[:60]}: {eligible} ballot(s) with contest, "
-                        f"{votes_cast} ballot(s) with votes, {undervotes} undervote(s)"
-                    )
-                    for choice, count in sorted(choice_totals.items()):
-                        if count > 0:
-                            print(f"      {choice[:40]}: {count}")
-
-    except Exception as e:
-        print(f"Error: {e}", file=sys.stderr)
-        sys.exit(1)
+    # Redaction mode: not yet implemented.
+    print("Redaction is not yet implemented.", file=sys.stderr)
+    sys.exit(1)
 
 
 if __name__ == "__main__":
