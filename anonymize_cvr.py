@@ -25,11 +25,14 @@ import argparse
 import csv
 import sys
 from collections import defaultdict
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Tuple
 
 from cvr_utils import TempCVRFile
 
 MIN_BALLOTS_DEFAULT = 10
+NEAR_UNANIMOUS_THRESHOLD = 2  # "all but N votes" triggers balancing (Rule c)
+MIN_CONTRASTING_VOTES = 3  # contrasting votes needed per contest after balancing
+COVERAGE_WEIGHT = 10.0  # weight for contest coverage vs. vote-balance score
 
 
 # ---------------------------------------------------------------------------
@@ -49,6 +52,11 @@ class CvrDatabase:
               ImprintedId, CountingGroup, PrecinctPortion, BallotType, ...)
       Rows 5+: one ballot per row
 
+    Assumption: column 0 of every ballot row is the CvrNumber.  This is
+    used throughout the redaction logic to deduplicate ballots and to
+    identify which ballots have been aggregated.  No attempt is made to
+    locate CvrNumber by name in the header row.
+
     A ballot's style is a string of '1' and '0' characters, one per contest
     in contest_names order.  '1' means the contest is present on the ballot
     (at least one choice column is non-empty), '0' means it is absent.
@@ -57,6 +65,8 @@ class CvrDatabase:
 
       ballots               — all ballot rows as lists of strings
       contest_names         — ordered list of unique contest names
+      contest_to_columns    — contest name -> list of column indices
+      contest_choice_meta   — contest name -> {col_idx: choice_name}
       ballots_by_style      — ballots grouped by style string
       ballots_by_named_style — ballots grouped by named_style value
                                (only populated when named_style_col is set)
@@ -90,7 +100,9 @@ class CvrDatabase:
                                 per-precinct rare-style detection.
         """
         self.input_file = input_file
-        self.headerlen = headerlen  # may be updated to auto-detected value in _read_file()
+        self.headerlen = (
+            headerlen  # may be updated to auto-detected value in _read_file()
+        )
         self.named_style_col = named_style_col
         self.redact_on_precinct = redact_on_precinct
 
@@ -116,6 +128,9 @@ class CvrDatabase:
 
         # contest name -> list of column indices for that contest's choices
         self.contest_to_columns: Dict[str, List[int]] = {}
+
+        # contest name -> {col_idx: choice_name} (used for vote tallying)
+        self.contest_choice_meta: Dict[str, Dict[int, str]] = {}
 
         # Ballots grouped by style string.
         self.ballots_by_style: Dict[str, List[List[str]]] = {}
@@ -228,6 +243,36 @@ class CvrDatabase:
             mapping[name].append(col_idx)
         self.contest_to_columns = dict(mapping)
 
+        # Build choice metadata: for each contest, map column index to choice name.
+        self.contest_choice_meta = {}
+        for contest_name, col_indices in self.contest_to_columns.items():
+            col_map: Dict[int, str] = {}
+            for col_idx in col_indices:
+                choice_name = (
+                    self.choices[col_idx].strip() if col_idx < len(self.choices) else ""
+                )
+                col_map[col_idx] = choice_name if choice_name else f"Choice{col_idx}"
+            self.contest_choice_meta[contest_name] = col_map
+
+    def _should_skip_ballot(self, ballot: List[str]) -> bool:
+        """
+        Return True if this row is an artifact of a previous redaction pass
+        and should be excluded from style groupings and content validation.
+
+        Skips two kinds of rows:
+          - Redacted ballot rows: any vote column contains '*'
+          - The aggregate summary row: BallotType == "AGGREGATED" or CvrNumber == "AGGREGATED"
+        """
+        for col_idx in range(self.headerlen, len(ballot)):
+            if ballot[col_idx].strip() == "*":
+                return True
+        if self.ballot_type_idx is not None:
+            if ballot[self.ballot_type_idx].strip() == "AGGREGATED":
+                return True
+        if ballot[0].strip() == "AGGREGATED":
+            return True
+        return False
+
     def _validate_ballot_contents(self) -> None:
         """
         Verify that for each contest on each ballot, choice columns are either
@@ -235,6 +280,8 @@ class CvrDatabase:
         Mixed state indicates a malformed ballot row.
         """
         for i, ballot in enumerate(self.ballots):
+            if self._should_skip_ballot(ballot):
+                continue
             for contest_name, col_indices in self.contest_to_columns.items():
                 values = [ballot[col_idx].strip() for col_idx in col_indices]
                 empty_flags = [v == "" for v in values]
@@ -275,6 +322,8 @@ class CvrDatabase:
         ballot_types_by_style: Dict[str, Set[str]] = defaultdict(set)
 
         for ballot in self.ballots:
+            if self._should_skip_ballot(ballot):
+                continue
             style = self._style_for_ballot(ballot)
             by_style[style].append(ballot)
 
@@ -309,13 +358,11 @@ class RedactionNeeds:
     """
     Describes what the CVR requires before it can be safely published.
 
-    Populated by check_redaction_needs().  The redaction logic (to be added
-    later) will read this to decide what work to do.
+    Populated by check_redaction_needs().  The redaction logic reads this to
+    decide what work to do.
 
     Rare styles and rare precincts both require the same kind of treatment:
     ballots must be aggregated so no individual voter can be identified.
-    Near-unanimity checking (Rule 7) applies to both and will be added here
-    when that phase is implemented.
     """
 
     def __init__(self) -> None:
@@ -392,6 +439,745 @@ def check_redaction_needs(
 
 
 # ---------------------------------------------------------------------------
+# Aggregate
+# ---------------------------------------------------------------------------
+
+
+class Aggregate:
+    """
+    Accumulates ballots into the anonymized aggregate pool, tracking
+    counts needed to verify the redaction rules.
+
+    All four anonymization rules pertain to building the aggregate:
+
+    Rule a: The aggregate must contain at least min_ballots ballots in total.
+
+    Rule b: For each rare contest (one that appears on at least one rare
+            ballot), the aggregate must contain at least min_ballots ballots
+            that include that contest.
+
+    Rule c: No contest in the aggregate may be near-unanimous.  "Near-
+            unanimous" means all but NEAR_UNANIMOUS_THRESHOLD (default
+            value = 2) votes go to a single choice.  If a contest is
+            near-unanimous, contrasting ballots are borrowed from the
+            common pool until at least MIN_CONTRASTING_VOTES (default
+            value = 3) ballots vote for a non-leading choice. Only contests
+            on rare ballots are checked; near-unanimity in contests that
+            belong only to common styles is not a concern.
+
+    Rule d: A ballot may only be borrowed from a common style if that style
+            will still have at least min_ballots ballots remaining after the
+            borrow.  Enforced by CommonPool, which removes a style from the
+            pool entirely once it would drop below the minimum.
+    """
+
+    def __init__(
+        self,
+        initial_ballots: List[List[str]],
+        rare_contests: Set[str],
+        db: CvrDatabase,
+        min_ballots: int,
+    ) -> None:
+        self._db = db
+        self.min_ballots = min_ballots
+        self.rare_contests = rare_contests
+        self.ballots: List[List[str]] = []
+        self._cvr_numbers: Set[str] = set()
+
+        # For each contest, how many ballots in the aggregate include that contest.
+        self._contest_ballot_counts: Dict[str, int] = defaultdict(int)
+
+        # For each contest (the list of contests already exists in the db and will
+        # not change), establish a dictionary which maps the contest name to an inner
+        # dictionary (which will be filled in by add()) which will map the contest's
+        # choices to the number of votes for each choice.
+        self._contest_choice_counts: Dict[str, Dict[str, int]] = {
+            c: {} for c in db.contest_to_columns
+        }
+        for ballot in initial_ballots:
+            self.add(ballot)
+
+    def add(self, ballot: List[str]) -> None:
+        """Add a ballot to the aggregate, updating all tracked counts."""
+        self.ballots.append(ballot)
+        cvr_num = ballot[0].strip()
+        if cvr_num:
+            self._cvr_numbers.add(cvr_num)
+
+        for contest_name, col_indices in self._db.contest_to_columns.items():
+            present = any(ballot[col_idx].strip() != "" for col_idx in col_indices)
+            if present:
+                self._contest_ballot_counts[contest_name] += 1
+
+        for contest_name, col_map in self._db.contest_choice_meta.items():
+            for col_idx, choice_name in col_map.items():
+                val = ballot[col_idx].strip()
+                if not val or val == "0":
+                    continue
+                try:
+                    increment = int(float(val))
+                except ValueError:
+                    increment = 1
+                # get the inner [choice_name:count] dict for the contest.
+                counts = self._contest_choice_counts[contest_name]
+                counts[choice_name] = counts.get(choice_name, 0) + increment
+
+    def contains_cvr(self, cvr_num: str) -> bool:
+        return cvr_num in self._cvr_numbers
+
+    def total_count(self) -> int:
+        return len(self.ballots)
+
+    def needs_more_total_ballots(self) -> bool:
+        """True if the aggregate does not yet have min_ballots total (Rule a)."""
+        return len(self.ballots) < self.min_ballots
+
+    def contests_needing_ballots(self) -> Dict[str, int]:
+        """
+        Return {contest: ballots_still_needed} for Rule b (each rare contest
+        needs >= min_ballots).
+        """
+        result = {}
+        for contest in self.rare_contests:
+            count = self._contest_ballot_counts[contest]
+            if count < self.min_ballots:
+                result[contest] = self.min_ballots - count
+        return result
+
+    def satisfies_minimums(self) -> bool:
+        """True when both Rule a and Rule b are satisfied."""
+        return (
+            not self.needs_more_total_ballots()
+            and len(self.contests_needing_ballots()) == 0
+        )
+
+    def choice_counts(self) -> Dict[str, Dict[str, int]]:
+        """Return per-contest per-choice vote counts (used for unanimity checking)."""
+        return self._contest_choice_counts
+
+
+# ---------------------------------------------------------------------------
+# CommonPool
+# ---------------------------------------------------------------------------
+
+
+class CommonPool:
+    """
+    Pool of common-style ballots available for borrowing into the aggregate.
+
+    Enforces Rule d: removing a ballot from a style never leaves that style
+    with fewer than min_ballots ballots.  Styles that would fall below the
+    minimum are removed from the pool entirely.
+    """
+
+    def __init__(self, styles: Dict[str, List[List[str]]], min_ballots: int) -> None:
+        self._styles: Dict[str, List[List[str]]] = {
+            sig: list(rows) for sig, rows in styles.items()
+        }
+        self.min_ballots = min_ballots
+
+    def is_empty(self) -> bool:
+        return len(self._styles) == 0
+
+    def styles(self) -> Dict[str, List[List[str]]]:
+        return self._styles
+
+    def remove(self, style_sig: str, row_idx: int) -> None:
+        """Remove one ballot; remove the style from the pool if it drops below min_ballots."""
+        rows = self._styles[style_sig]
+        rows.pop(row_idx)
+        if len(rows) < self.min_ballots:
+            del self._styles[style_sig]
+
+    def remove_by_cvr_numbers(self, cvr_numbers: Set[str]) -> None:
+        """Remove all ballots whose CvrNumber is in the given set."""
+        for style_sig in list(self._styles.keys()):
+            remaining = [
+                row
+                for row in self._styles[style_sig]
+                if row[0].strip() not in cvr_numbers
+            ]
+            if len(remaining) < self.min_ballots:
+                del self._styles[style_sig]
+            else:
+                self._styles[style_sig] = remaining
+
+    def best_candidate_for(
+        self, aggregate: Aggregate, db: CvrDatabase
+    ) -> Optional[Tuple[str, int, List[str]]]:
+        """
+        Return (style_sig, row_idx, ballot) for the best ballot to borrow, or None.
+
+        Prioritizes ballots that cover the most contests still needing ballots
+        (Rule b), weighted by how much they reduce vote imbalance.  Falls back
+        to any ballot from the largest available style when only the total count
+        is short (Rule a).
+        """
+        needed = aggregate.contests_needing_ballots()
+        if needed:
+            return self._best_for_contests(aggregate, db, needed)
+        elif aggregate.needs_more_total_ballots():
+            return self._any_candidate(aggregate)
+        else:
+            return None
+
+    def _best_for_contests(
+        self,
+        aggregate: Aggregate,
+        db: CvrDatabase,
+        needed: Dict[str, int],
+    ) -> Optional[Tuple[str, int, List[str]]]:
+        """
+        Find the best ballot for bringing the aggregation into agreement with Rule b
+        (has at least min_ballots per contest).
+
+        The arg "needed" is a dictionary: {contest:number of ballots needed for that contest}
+        """
+
+        needed_list = [c for c, n in needed.items() if n > 0]
+        best_candidate: Optional[Tuple[str, int, List[str]]] = None
+        best_score = -1.0
+
+        for style_sig, rows in self._styles.items():
+            if len(rows) <= self.min_ballots:
+                continue
+            for idx, row in enumerate(rows):
+                cvr_num = row[0].strip()
+                if cvr_num and aggregate.contains_cvr(cvr_num):
+                    continue
+                covered = [
+                    contest
+                    for contest in needed_list
+                    if _ballot_has_contest(row, contest, db.contest_to_columns)
+                ]
+                if not covered:
+                    continue
+                # "gain" indicates an improvement in the score, even though it is
+                # accomplished by a "reduction" in the imbalance.
+                gain = sum(
+                    _imbalance_reduction(
+                        c, row, aggregate.choice_counts(), db.contest_choice_meta
+                    )
+                    for c in covered
+                )
+                score = COVERAGE_WEIGHT * len(covered) + gain
+                if score > best_score:
+                    best_score = score
+                    best_candidate = (style_sig, idx, row)
+
+        return best_candidate
+
+    def _any_candidate(
+        self, aggregate: Aggregate
+    ) -> Optional[Tuple[str, int, List[str]]]:
+        """Pick any ballot from the largest borrowable style."""
+        best_sig = None
+        best_count = 0
+        for style_sig, rows in self._styles.items():
+            if len(rows) > self.min_ballots and len(rows) > best_count:
+                best_sig = style_sig
+                best_count = len(rows)
+        if best_sig is None:
+            return None
+        for idx, row in enumerate(self._styles[best_sig]):
+            cvr_num = row[0].strip()
+            if cvr_num and aggregate.contains_cvr(cvr_num):
+                continue
+            return (best_sig, idx, row)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Redaction helpers
+# ---------------------------------------------------------------------------
+
+
+def _ballot_has_contest(
+    ballot: List[str], contest: str, contest_to_columns: Dict[str, List[int]]
+) -> bool:
+    """Return True if the ballot has any non-empty column for the given contest."""
+    col_indices = contest_to_columns.get(contest, [])
+    return any(ballot[col_idx].strip() != "" for col_idx in col_indices)
+
+
+def _imbalance_reduction(
+    contest: str,
+    ballot: List[str],
+    choice_counts: Dict[str, Dict[str, int]],
+    contest_choice_meta: Dict[str, Dict[int, str]],
+) -> float:
+    """
+    Estimate how much adding this ballot reduces vote imbalance for a contest.
+
+    Imbalance is max_choice_votes minus the sum of all other votes.
+    Returns the improvement (positive = less imbalanced), or 0.0 if the ballot
+    does not participate in the contest or makes imbalance worse.
+    """
+
+    # "current" is the dict that maps choices to votes for that contest.
+    # "total" is the sum of all votes for all choices
+    # current_max is the vote total for the choice with the highest number of votes.
+    current = choice_counts.get(contest, {})
+    current_total = sum(current.values())
+    current_max = max(current.values()) if current else 0
+    current_gap = current_max - (current_total - current_max)
+
+    # record the votes on this ballot for each of the choices available for this contest
+    contributions: Dict[str, int] = {}
+    for col_idx, choice_name in contest_choice_meta[contest].items():
+        val = ballot[col_idx].strip()
+        if not val or val == "0":
+            continue
+        contributions[choice_name] = 1
+
+    if not contributions:
+        return 0.0
+
+    new_counts = dict(current)
+    for choice_name, inc in contributions.items():
+        new_counts[choice_name] = new_counts.get(choice_name, 0) + inc
+    new_total = current_total + sum(contributions.values())
+    new_max = max(new_counts.values()) if new_counts else 0
+    new_gap = new_max - (new_total - new_max)
+
+    return max(0.0, current_gap - new_gap)
+
+
+def _build_aggregate_row(
+    ballots: List[List[str]], db: CvrDatabase, aggregate_id: str
+) -> List[str]:
+    """
+    Build the AGGREGATED CSV row by summing vote columns and blanking identifiers.
+
+    Fixed header columns (TabulatorNum through ImprintedId) are blanked.
+    CountingGroup, PrecinctPortion, and named_style are blanked.
+    BallotType is set to "AGGREGATED".
+    Vote columns are summed across all ballots in the aggregate.
+    """
+    if not ballots:
+        return []
+
+    result = ballots[0][: db.headerlen].copy()
+    result[0] = aggregate_id
+    if len(result) > 1:
+        result[1] = ""  # TabulatorNum
+    if len(result) > 2:
+        result[2] = ""  # BatchId
+    if len(result) > 3:
+        result[3] = ""  # RecordId
+    if len(result) > 4:
+        result[4] = ""  # ImprintedId
+    if db.named_style_col is not None:
+        result[db.named_style_col] = ""
+    if db.counting_group_idx is not None:
+        result[db.counting_group_idx] = ""
+    if db.precinct_portion_idx is not None:
+        result[db.precinct_portion_idx] = ""
+    if db.ballot_type_idx is not None:
+        result[db.ballot_type_idx] = "AGGREGATED"
+
+    # Sum vote columns across all ballots.
+    num_cols = len(ballots[0])
+    for col_idx in range(db.headerlen, num_cols):
+        total = 0.0
+        for ballot in ballots:
+            val = ballot[col_idx].strip()
+            if val and val.replace(".", "").replace("-", "").isdigit():
+                try:
+                    total += float(val)
+                except ValueError:
+                    pass
+        if total == int(total):
+            result.append(str(int(total)))
+        else:
+            result.append(str(total))
+
+    return result
+
+
+def _redact_ballot_row(ballot: List[str], db: CvrDatabase) -> List[str]:
+    """
+    Return a copy of the ballot with all vote columns replaced by '*'.
+
+    CountingGroup and PrecinctPortion are always blanked on redacted rows,
+    regardless of the --redact-on-precinct setting.
+    """
+    result = ballot.copy()
+    if db.counting_group_idx is not None:
+        result[db.counting_group_idx] = ""
+    if db.precinct_portion_idx is not None:
+        result[db.precinct_portion_idx] = ""
+    for col_idx in range(db.headerlen, len(result)):
+        result[col_idx] = "*"
+    return result
+
+
+def _blank_geographic_fields(
+    ballot: List[str], db: CvrDatabase, redact_on_precinct: bool
+) -> List[str]:
+    """
+    Return a copy of the ballot with geographic fields blanked.
+
+    CountingGroup is always blanked.
+
+    PrecinctPortion handling:
+      - If redact_on_precinct is False: blank it on all ballots, because
+        precinct information is not safe to publish without per-precinct
+        redaction.
+      - If redact_on_precinct is True: keep it on non-redacted ballots,
+        because rare precincts have already been aggregated and the
+        remaining precinct values are safe.
+    """
+    result = ballot.copy()
+    if db.counting_group_idx is not None:
+        result[db.counting_group_idx] = ""
+    if not redact_on_precinct and db.precinct_portion_idx is not None:
+        result[db.precinct_portion_idx] = ""
+    return result
+
+
+def build_aggregate(
+    rare_ballots: List[List[str]],
+    rare_contests: Set[str],
+    pool: CommonPool,
+    db: CvrDatabase,
+    min_ballots: int,
+) -> Aggregate:
+    """
+    Build the aggregate from rare ballots, borrowing from the pool as needed.
+
+    Satisfies Rules a and b simultaneously using a coverage-weighted ballot
+    selection: each borrowed ballot is chosen to cover as many under-represented
+    contests as possible while also reducing vote imbalance.  Rule d (only borrow
+    from styles that remain common after borrowing) is enforced by CommonPool.
+    """
+    aggregate = Aggregate(rare_ballots, rare_contests, db, min_ballots)
+
+    while not aggregate.satisfies_minimums():
+        result = pool.best_candidate_for(aggregate, db)
+        if result is None:
+            for contest, needed in aggregate.contests_needing_ballots().items():
+                print(
+                    f"Warning: could not find enough ballots for contest "
+                    f"'{contest}' (still need {needed} more). "
+                    f"This contest may only appear on rare ballot styles.",
+                    file=sys.stderr,
+                )
+            break
+        style_sig, row_idx, ballot = result
+        aggregate.add(ballot)
+        pool.remove(style_sig, row_idx)
+
+    return aggregate
+
+
+def balance_unanimity(
+    aggregate: Aggregate,
+    pool: CommonPool,
+    db: CvrDatabase,
+) -> None:
+    """
+    Add contrasting ballots to prevent near-unanimous vote patterns (Rule c).
+
+    Only checks contests that appeared on rare ballots; near-unanimity in
+    contests that belong only to common styles is not a concern here.
+    """
+    contest_totals = aggregate.choice_counts()
+
+    problematic: List[Tuple] = []
+    for contest_name, choice_votes in contest_totals.items():
+        if contest_name not in aggregate.rare_contests:
+            continue
+        if not choice_votes:
+            continue
+        total_votes = sum(choice_votes.values())
+        if total_votes == 0:
+            continue
+        max_choice = max(choice_votes, key=lambda c: choice_votes[c])
+        max_votes = choice_votes[max_choice]
+        other_votes = total_votes - max_votes
+        if other_votes <= NEAR_UNANIMOUS_THRESHOLD:
+            problematic.append((contest_name, max_choice, max_votes, total_votes))
+
+    if not problematic:
+        return
+
+    contrasting = find_contrasting_ballots_multi(problematic, pool, db)
+    if contrasting:
+        borrowed_cvr_nums = {b[0].strip() for b in contrasting if b[0].strip()}
+        pool.remove_by_cvr_numbers(borrowed_cvr_nums)
+        for ballot in contrasting:
+            aggregate.add(ballot)
+
+
+def find_contrasting_ballots_multi(
+    problematic_contests: List[Tuple],
+    pool: CommonPool,
+    db: CvrDatabase,
+) -> List[List[str]]:
+    """
+    Find ballots from the pool that vote differently in near-unanimous contests.
+
+    Minimizes total ballots borrowed by preferring ballots that address multiple
+    problematic contests at once.  Aims for MIN_CONTRASTING_VOTES differing
+    ballots per contest.
+    """
+    if not problematic_contests:
+        return []
+
+    # For each problematic contest, find which column holds the leading choice.
+    contest_info: Dict[str, Dict] = {}
+    for contest_name, winning_choice, _, _ in problematic_contests:
+        col_indices = db.contest_to_columns.get(contest_name, [])
+        if not col_indices:
+            continue
+        col_map = db.contest_choice_meta.get(contest_name, {})
+        winning_col = None
+        for col_idx, choice_name in col_map.items():
+            if choice_name == winning_choice:
+                winning_col = col_idx
+                break
+        contest_info[contest_name] = {
+            "col_indices": col_indices,
+            "winning_col": winning_col,
+        }
+
+    # Score each available ballot by how many problematic contests it votes against.
+    ballot_scores: List[Tuple[int, List[str], List[str]]] = []
+    for style_sig, rows in pool.styles().items():
+        if len(rows) <= pool.min_ballots:
+            continue
+        for ballot in rows:
+            satisfied = []
+            for contest_name, _, _, _ in problematic_contests:
+                if contest_name not in contest_info:
+                    continue
+                info = contest_info[contest_name]
+                has_contest = any(
+                    ballot[col_idx].strip() != "" for col_idx in info["col_indices"]
+                )
+                if not has_contest:
+                    continue
+                winning_col = info["winning_col"]
+                if winning_col is not None and ballot[winning_col].strip() != "1":
+                    for col_idx in info["col_indices"]:
+                        if col_idx != winning_col and ballot[col_idx].strip() == "1":
+                            satisfied.append(contest_name)
+                            break
+            if satisfied:
+                ballot_scores.append((len(satisfied), satisfied, ballot))
+
+    ballot_scores.sort(key=lambda x: x[0], reverse=True)
+
+    # Greedily select ballots until each problematic contest has enough contrast.
+    contests_needed: Set[str] = {name for name, _, _, _ in problematic_contests}
+    selected: List[List[str]] = []
+    contrast_counts: Dict[str, int] = defaultdict(int)
+
+    for score, satisfied, ballot in ballot_scores:
+        if set(satisfied) & contests_needed:
+            selected.append(ballot)
+            for c in satisfied:
+                contrast_counts[c] += 1
+            for c in list(contests_needed):
+                if contrast_counts[c] >= MIN_CONTRASTING_VOTES:
+                    contests_needed.discard(c)
+            if not contests_needed:
+                break
+
+    return selected
+
+
+def _verify_redaction_tally(
+    db: CvrDatabase,
+    aggregated_cvr_nums: Set[str],
+    aggregate_row: List[str],
+) -> None:
+    """
+    Verify that the aggregate row correctly captures all votes from aggregated ballots.
+
+    The output preserves tallies if and only if the aggregate row's vote column
+    sums equal the original vote values from the aggregated ballot rows.
+    Raises ValueError if a mismatch is found.
+    """
+    # Tally votes from the aggregated ballots in the original database.
+    original_tally: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    for ballot in db.ballots:
+        if ballot[0].strip() not in aggregated_cvr_nums:
+            continue
+        for contest_name, col_map in db.contest_choice_meta.items():
+            for col_idx, choice_name in col_map.items():
+                if ballot[col_idx].strip() == "1":
+                    original_tally[contest_name][choice_name] += 1
+
+    # Tally votes from the aggregate row.
+    row_tally: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    for contest_name, col_map in db.contest_choice_meta.items():
+        for col_idx, choice_name in col_map.items():
+            if col_idx >= len(aggregate_row):
+                continue
+            val = aggregate_row[col_idx].strip()
+            if val:
+                try:
+                    count = int(float(val))
+                    if count > 0:
+                        row_tally[contest_name][choice_name] += count
+                except ValueError:
+                    pass
+
+    mismatches = []
+    all_contests = set(original_tally.keys()) | set(row_tally.keys())
+    for contest_name in sorted(all_contests):
+        orig = original_tally.get(contest_name, {})
+        row = row_tally.get(contest_name, {})
+        all_choices = set(orig.keys()) | set(row.keys())
+        for choice_name in sorted(all_choices):
+            o = orig.get(choice_name, 0)
+            r = row.get(choice_name, 0)
+            if o != r:
+                mismatches.append((contest_name, choice_name, o, r))
+
+    if mismatches:
+        print(
+            "ERROR: Tally mismatch between aggregated ballots and aggregate row:",
+            file=sys.stderr,
+        )
+        for contest, choice, expected, got in mismatches:
+            print(
+                f"  '{contest}' / '{choice}': "
+                f"aggregated ballots={expected}, aggregate row={got}",
+                file=sys.stderr,
+            )
+        raise ValueError(
+            "Anonymization failed: aggregate row tallies do not match original. "
+            "This indicates a bug in the aggregation logic."
+        )
+
+
+def perform_redaction(
+    db: CvrDatabase,
+    needs: RedactionNeeds,
+    min_ballots: int,
+    output_file: str,
+    redact_on_precinct: bool,
+) -> None:
+    """
+    Perform redaction and write the anonymized CVR to output_file.
+
+    If no redaction is needed, writes the file with only geographic fields
+    blanked and no aggregate row appended.
+
+    For each ballot in the aggregate (rare or borrowed), the vote columns are
+    replaced with '*' and the row appears in its original position in the file.
+    The AGGREGATED row with summed vote counts is appended at the end.
+    """
+    if not needs.needs_redaction():
+        with open(output_file, "w", encoding="utf-8", newline="") as f:
+            writer = csv.writer(f, lineterminator=db.lineterminator)
+            writer.writerow(db.version)
+            writer.writerow(db.contests)
+            writer.writerow(db.choices)
+            writer.writerow(db.headers)
+            for ballot in db.ballots:
+                writer.writerow(
+                    _blank_geographic_fields(ballot, db, redact_on_precinct)
+                )
+        print("No redaction needed.  Output written.")
+        return
+
+    # Collect the initial set of ballots to aggregate:
+    # all ballots from rare styles, plus rare precincts if applicable.
+    initial_rare_cvr_nums: Set[str] = set()
+    rare_ballots: List[List[str]] = []
+
+    for style in needs.rare_styles:
+        for ballot in db.ballots_by_style.get(style, []):
+            cvr_num = ballot[0].strip()
+            if cvr_num not in initial_rare_cvr_nums:
+                initial_rare_cvr_nums.add(cvr_num)
+                rare_ballots.append(ballot)
+
+    if needs.rare_precincts:
+        for precinct in needs.rare_precincts:
+            for ballot in db.ballots_by_precinct.get(precinct, []):
+                cvr_num = ballot[0].strip()
+                if cvr_num not in initial_rare_cvr_nums:
+                    initial_rare_cvr_nums.add(cvr_num)
+                    rare_ballots.append(ballot)
+
+    # Determine the rare contests: any contest appearing on any rare ballot.
+    rare_contests: Set[str] = set()
+    for ballot in rare_ballots:
+        for contest_name, col_indices in db.contest_to_columns.items():
+            if any(ballot[col_idx].strip() != "" for col_idx in col_indices):
+                rare_contests.add(contest_name)
+
+    # Build the common pool from non-rare styles, excluding any ballots already
+    # captured by the rare-precinct set.
+    rare_style_set = set(needs.rare_styles.keys())
+    common_style_to_ballots_dict: Dict[str, List[List[str]]] = {}
+    for style, ballots in db.ballots_by_style.items():
+        if style in rare_style_set:
+            continue
+        # If ballot b is in initial_rare_cvr_nums, it can't be counted as an available
+        # ballot in this style.
+        if initial_rare_cvr_nums:
+            available = [
+                b for b in ballots if b[0].strip() not in initial_rare_cvr_nums
+            ]
+        else:
+            available = list(ballots)
+        if len(available) >= min_ballots:
+            common_style_to_ballots_dict[style] = available
+
+    pool = CommonPool(common_style_to_ballots_dict, min_ballots)
+
+    # Build aggregate (Rules a, b, d).
+    aggregate = build_aggregate(rare_ballots, rare_contests, pool, db, min_ballots)
+
+    # Add contrasting ballots if needed (Rule c: no near-unanimity).
+    balance_unanimity(aggregate, pool, db)
+
+    # Record which CvrNumbers ended up in the aggregate (rare + borrowed).
+    aggregated_cvr_nums: Set[str] = {
+        ballot[0].strip() for ballot in aggregate.ballots if ballot[0].strip()
+    }
+
+    # Build the aggregate row and verify tally.
+    aggregate_row = _build_aggregate_row(aggregate.ballots, db, "AGGREGATED")
+    _verify_redaction_tally(db, aggregated_cvr_nums, aggregate_row)
+
+    # Write the output file.
+    # Ballots in the aggregate have vote columns replaced with '*'.
+    # All ballots have geographic fields blanked per the redact_on_precinct setting.
+    # The aggregate row is appended at the end in its own row.
+    with open(output_file, "w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f, lineterminator=db.lineterminator)
+        writer.writerow(db.version)
+        writer.writerow(db.contests)
+        writer.writerow(db.choices)
+        writer.writerow(db.headers)
+        for ballot in db.ballots:
+            cvr_num = ballot[0].strip()
+            if cvr_num in aggregated_cvr_nums:
+                writer.writerow(_redact_ballot_row(ballot, db))
+            else:
+                writer.writerow(
+                    _blank_geographic_fields(ballot, db, redact_on_precinct)
+                )
+        writer.writerow(aggregate_row)
+
+    initial_count = len(initial_rare_cvr_nums)
+    borrowed_count = len(aggregated_cvr_nums) - initial_count
+    print("Redaction complete.")
+    print(f"  Ballots from rare styles/precincts: {initial_count}")
+    if borrowed_count > 0:
+        print(f"  Ballots borrowed from common styles: {borrowed_count}")
+    print(f"  Total ballots in aggregate: {len(aggregated_cvr_nums)}")
+    print(f"  Output written to: {output_file}")
+
+
+# ---------------------------------------------------------------------------
 # Argument parsing
 # ---------------------------------------------------------------------------
 
@@ -456,6 +1242,8 @@ def parse_args() -> argparse.Namespace:
         help="Column index (0-based) of the named_style field, if present.",
     )
     args = parser.parse_args()
+    if args.check and args.output_file is not None:
+        parser.error("output_file cannot be specified in --check mode.")
     if not args.check and args.output_file is None:
         parser.error("output_file is required when not in --check mode.")
     return args
@@ -506,7 +1294,9 @@ def main() -> None:
                     f"({len(needs.rare_styles)} of {total_styles} total):"
                 )
                 # Sort by ballot count, fewest first.
-                for style, count in sorted(needs.rare_styles.items(), key=lambda item: item[1]):
+                for style, count in sorted(
+                    needs.rare_styles.items(), key=lambda item: item[1]
+                ):
                     description = f"{count} ballot(s), {style.count('1')} contest(s)"
                     # Add ballot type(s) as a human-readable identifier, if available.
                     ballot_types = db.ballot_types_by_style.get(style, set())
@@ -525,9 +1315,14 @@ def main() -> None:
             print("No redaction needed.")
         return
 
-    # Redaction mode: not yet implemented.
-    print("Redaction is not yet implemented.", file=sys.stderr)
-    sys.exit(1)
+    # Redaction mode.
+    try:
+        perform_redaction(
+            db, needs, args.min_ballots, args.output_file, args.redact_on_precinct
+        )
+    except (ValueError, OSError) as e:
+        print(f"Error during redaction: {e}", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
