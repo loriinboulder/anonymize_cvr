@@ -72,7 +72,7 @@ class CvrDatabase:
                                (only populated when named_style_col is set)
       ballots_by_ballot_type — ballots grouped by BallotType value
                                (only populated when the column exists)
-      ballots_by_precinct   — ballots grouped by PrecinctPortion value
+      ballots_by_style_precinct — ballots grouped by (style, PrecinctPortion) pair
                                (only populated when redact_on_precinct is True
                                and the PrecinctPortion column exists)
 
@@ -96,8 +96,8 @@ class CvrDatabase:
             headerlen:          Number of header columns before vote data begins.
                                 Pass 0 to auto-detect from the contests row.
             named_style_col:    Column index of the named_style field, or None.
-            redact_on_precinct: If True, populate ballots_by_precinct for
-                                per-precinct rare-style detection.
+            redact_on_precinct: If True, populate ballots_by_style_precinct for
+                                (style, precinct) combination rare-pair detection.
         """
         self.input_file = input_file
         self.headerlen = (
@@ -141,9 +141,9 @@ class CvrDatabase:
         # Ballots grouped by BallotType value (only when ballot_type_idx is set).
         self.ballots_by_ballot_type: Dict[str, List[List[str]]] = {}
 
-        # Ballots grouped by PrecinctPortion value.
+        # Ballots grouped by (style, PrecinctPortion) pair.
         # Only populated when redact_on_precinct is True and precinct_portion_idx is set.
-        self.ballots_by_precinct: Dict[str, List[List[str]]] = {}
+        self.ballots_by_style_precinct: Dict[Tuple[str, str], List[List[str]]] = {}
 
         # For leakage detection: per style, which named_style / ballot_type values appear.
         self.named_styles_by_style: Dict[str, Set[str]] = {}
@@ -317,7 +317,7 @@ class CvrDatabase:
         by_style: Dict[str, List[List[str]]] = defaultdict(list)
         by_named_style: Dict[str, List[List[str]]] = defaultdict(list)
         by_ballot_type: Dict[str, List[List[str]]] = defaultdict(list)
-        by_precinct: Dict[str, List[List[str]]] = defaultdict(list)
+        by_style_precinct: Dict[Tuple[str, str], List[List[str]]] = defaultdict(list)
         named_styles_by_style: Dict[str, Set[str]] = defaultdict(set)
         ballot_types_by_style: Dict[str, Set[str]] = defaultdict(set)
 
@@ -339,12 +339,12 @@ class CvrDatabase:
 
             if self.redact_on_precinct and self.precinct_portion_idx is not None:
                 precinct = ballot[self.precinct_portion_idx].strip()
-                by_precinct[precinct].append(ballot)
+                by_style_precinct[(style, precinct)].append(ballot)
 
         self.ballots_by_style = dict(by_style)
         self.ballots_by_named_style = dict(by_named_style)
         self.ballots_by_ballot_type = dict(by_ballot_type)
-        self.ballots_by_precinct = dict(by_precinct)
+        self.ballots_by_style_precinct = dict(by_style_precinct)
         self.named_styles_by_style = dict(named_styles_by_style)
         self.ballot_types_by_style = dict(ballot_types_by_style)
 
@@ -361,8 +361,8 @@ class RedactionNeeds:
     Populated by check_redaction_needs().  The redaction logic reads this to
     decide what work to do.
 
-    Rare styles and rare precincts both require the same kind of treatment:
-    ballots must be aggregated so no individual voter can be identified.
+    Rare styles and rare (style, precinct) pairs both require the same kind of
+    treatment: ballots must be aggregated so no individual voter can be identified.
     """
 
     def __init__(self) -> None:
@@ -370,17 +370,19 @@ class RedactionNeeds:
         # Key: style string.  Value: ballot count.
         self.rare_styles: Dict[str, int] = {}
 
-        # Precincts with too few ballots.
+        # (style, precinct) pairs with too few ballots.
         # Only populated when --redact-on-precinct is requested.
-        # Key: PrecinctPortion value.  Value: ballot count.
-        self.rare_precincts: Dict[str, int] = {}
+        # Per C.R.S. 24-72-205.5, the privacy unit is the combination of contest
+        # pattern and precinct, not each independently.
+        # Key: (style string, PrecinctPortion value).  Value: ballot count.
+        self.rare_style_precinct_pairs: Dict[Tuple[str, str], int] = {}
 
         # Human-readable leakage warnings.  Leakage is reported but not corrected.
         self.leakage_warnings: List[str] = []
 
     def needs_redaction(self) -> bool:
         """Return True if any redaction work is required."""
-        return len(self.rare_styles) > 0 or len(self.rare_precincts) > 0
+        return len(self.rare_styles) > 0 or len(self.rare_style_precinct_pairs) > 0
 
 
 # ---------------------------------------------------------------------------
@@ -409,11 +411,14 @@ def check_redaction_needs(
         if len(ballots) < min_ballots:
             needs.rare_styles[style] = len(ballots)
 
-    # Check for rare precincts.
-    # ballots_by_precinct is only populated when --redact-on-precinct was set.
-    for precinct, ballots in db.ballots_by_precinct.items():
+    # Check for rare (style, precinct) combinations.
+    # ballots_by_style_precinct is only populated when --redact-on-precinct was set.
+    # Per statute, the privacy unit is the combination of contest pattern and precinct,
+    # so a pair is rare when it has fewer than min_ballots ballots even if both the
+    # style and the precinct individually have enough ballots.
+    for pair, ballots in db.ballots_by_style_precinct.items():
         if len(ballots) < min_ballots:
-            needs.rare_precincts[precinct] = len(ballots)
+            needs.rare_style_precinct_pairs[pair] = len(ballots)
 
     # Check for named_style leakage (Rule 10).
     # Leakage: more than one named_style maps to the same contest pattern.
@@ -836,6 +841,21 @@ def _blank_geographic_fields(
     return result
 
 
+def _print_borrowing_needs(aggregate: Aggregate, min_ballots: int) -> None:
+    """Print a one-time summary of why ballot borrowing is needed."""
+    if aggregate.needs_more_total_ballots():
+        needed = min_ballots - aggregate.total_count()
+        print(
+            f"  Aggregate has {aggregate.total_count()} ballot(s); "
+            f"need {needed} more to reach minimum of {min_ballots}."
+        )
+    contest_needs = aggregate.contests_needing_ballots()
+    if contest_needs:
+        print("  Contests below minimum:")
+        for contest, needed in sorted(contest_needs.items()):
+            print(f"    '{contest}': needs {needed} more ballot(s)")
+
+
 def build_aggregate(
     rare_ballots: List[List[str]],
     rare_contests: Set[str],
@@ -853,6 +873,18 @@ def build_aggregate(
     """
     aggregate = Aggregate(rare_ballots, rare_contests, db, min_ballots)
 
+    if not aggregate.satisfies_minimums():
+        print(
+            f"  Rare ballots: {aggregate.total_count()}.  Borrowing from common styles:"
+        )
+        _print_borrowing_needs(aggregate, min_ballots)
+        print()
+        print(
+            "  Selecting ballots to borrow from common styles (this can take a few minutes)..."
+        )
+
+    borrowed_cvr_nums: List[str] = []
+
     while not aggregate.satisfies_minimums():
         result = pool.best_candidate_for(aggregate, db)
         if result is None:
@@ -865,8 +897,15 @@ def build_aggregate(
                 )
             break
         style_sig, row_idx, ballot = result
+        borrowed_cvr_nums.append(ballot[0].strip())
         aggregate.add(ballot)
         pool.remove(style_sig, row_idx)
+
+    if borrowed_cvr_nums:
+        print()
+        print(
+            f"  Borrowed {len(borrowed_cvr_nums)} ballot(s): {', '.join(borrowed_cvr_nums)}"
+        )
 
     return aggregate
 
@@ -884,6 +923,9 @@ def balance_unanimity(
     """
     contest_totals = aggregate.choice_counts()
 
+    # Construct a list of contests that are in the "near-unamimous" condition.
+    # That is, find contests whose top vote-holder is within NEAR_UNANIMOUS_THRESHOLD
+    # votes of the total votes in the contest.
     problematic: List[Tuple] = []
     for contest_name, choice_votes in contest_totals.items():
         if contest_name not in aggregate.rare_contests:
@@ -902,12 +944,23 @@ def balance_unanimity(
     if not problematic:
         return
 
+    for contest_name, max_choice, max_votes, total_votes in problematic:
+        print(
+            f"    '{contest_name}': '{max_choice}' has "
+            f"{max_votes} out of {total_votes} votes"
+        )
+
     contrasting = find_contrasting_ballots_multi(problematic, pool, db)
     if contrasting:
         borrowed_cvr_nums = {b[0].strip() for b in contrasting if b[0].strip()}
         pool.remove_by_cvr_numbers(borrowed_cvr_nums)
         for ballot in contrasting:
             aggregate.add(ballot)
+        print()
+        print(
+            f"  Borrowed {len(borrowed_cvr_nums)} contrasting ballot(s): "
+            f"{', '.join(sorted(borrowed_cvr_nums))}"
+        )
 
 
 def find_contrasting_ballots_multi(
@@ -988,27 +1041,43 @@ def find_contrasting_ballots_multi(
     return selected
 
 
+def _display_contest_name(name: str) -> str:
+    """Strip trailing '(Vote For=N)' from a contest name for display."""
+    idx = name.find(" (Vote For=")
+    return name[:idx] if idx >= 0 else name
+
+
 def _verify_redaction_tally(
     db: CvrDatabase,
     aggregated_cvr_nums: Set[str],
     aggregate_row: List[str],
 ) -> None:
     """
-    Verify that the aggregate row correctly captures all votes from aggregated ballots.
+    Verify that vote totals are preserved across the full CVR after redaction,
+    and print a comparison table.
 
-    The output preserves tallies if and only if the aggregate row's vote column
-    sums equal the original vote values from the aggregated ballot rows.
-    Raises ValueError if a mismatch is found.
+    Redacted total = (full original total) - (aggregated ballots) + (aggregate row).
+    These must equal the full original total, which requires that the aggregate row
+    exactly captures all votes from the aggregated ballots.  Raises ValueError if
+    a mismatch is found.
     """
-    # Tally votes from the aggregated ballots in the original database.
-    original_tally: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    # Tally votes from ALL original ballots.
+    full_tally: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    for ballot in db.ballots:
+        for contest_name, col_map in db.contest_choice_meta.items():
+            for col_idx, choice_name in col_map.items():
+                if ballot[col_idx].strip() == "1":
+                    full_tally[contest_name][choice_name] += 1
+
+    # Tally votes from only the aggregated ballots.
+    aggregated_tally: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
     for ballot in db.ballots:
         if ballot[0].strip() not in aggregated_cvr_nums:
             continue
         for contest_name, col_map in db.contest_choice_meta.items():
             for col_idx, choice_name in col_map.items():
                 if ballot[col_idx].strip() == "1":
-                    original_tally[contest_name][choice_name] += 1
+                    aggregated_tally[contest_name][choice_name] += 1
 
     # Tally votes from the aggregate row.
     row_tally: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
@@ -1025,17 +1094,48 @@ def _verify_redaction_tally(
                 except ValueError:
                     pass
 
-    mismatches = []
-    all_contests = set(original_tally.keys()) | set(row_tally.keys())
+    # Compute the redacted tally: full - aggregated ballots + aggregate row.
+    all_contests = set(full_tally.keys()) | set(row_tally.keys())
+    redacted_tally: Dict[str, Dict[str, int]] = {}
+    for contest_name in all_contests:
+        full_c = full_tally.get(contest_name, {})
+        agg_c = aggregated_tally.get(contest_name, {})
+        row_c = row_tally.get(contest_name, {})
+        all_choices = set(full_c.keys()) | set(agg_c.keys()) | set(row_c.keys())
+        redacted_tally[contest_name] = {}
+        for choice_name in all_choices:
+            redacted_tally[contest_name][choice_name] = (
+                full_c.get(choice_name, 0)
+                - agg_c.get(choice_name, 0)
+                + row_c.get(choice_name, 0)
+            )
+
+    # Print the full CVR tally comparison table.
+    NAME_COL = 40
+    print(f"\n  {'Contest/Choice':<{NAME_COL}} {'Original':>10} {'Redacted':>10}")
+    print(f"  {'-' * NAME_COL} {'-' * 10} {'-' * 10}")
     for contest_name in sorted(all_contests):
-        orig = original_tally.get(contest_name, {})
-        row = row_tally.get(contest_name, {})
-        all_choices = set(orig.keys()) | set(row.keys())
+        print(f"  {_display_contest_name(contest_name)}")
+        full_c = full_tally.get(contest_name, {})
+        red_c = redacted_tally.get(contest_name, {})
+        all_choices = set(full_c.keys()) | set(red_c.keys())
         for choice_name in sorted(all_choices):
-            o = orig.get(choice_name, 0)
+            o = full_c.get(choice_name, 0)
+            r = red_c.get(choice_name, 0)
+            if o > 0 or r > 0:
+                print(f"    {choice_name:<{NAME_COL - 2}} {o:>10} {r:>10}")
+
+    # Verify: aggregate row must exactly match the aggregated ballots.
+    mismatches = []
+    for contest_name in sorted(set(aggregated_tally.keys()) | set(row_tally.keys())):
+        agg = aggregated_tally.get(contest_name, {})
+        row = row_tally.get(contest_name, {})
+        all_choices = set(agg.keys()) | set(row.keys())
+        for choice_name in sorted(all_choices):
+            a = agg.get(choice_name, 0)
             r = row.get(choice_name, 0)
-            if o != r:
-                mismatches.append((contest_name, choice_name, o, r))
+            if a != r:
+                mismatches.append((contest_name, choice_name, a, r))
 
     if mismatches:
         print(
@@ -1097,9 +1197,9 @@ def perform_redaction(
                 initial_rare_cvr_nums.add(cvr_num)
                 rare_ballots.append(ballot)
 
-    if needs.rare_precincts:
-        for precinct in needs.rare_precincts:
-            for ballot in db.ballots_by_precinct.get(precinct, []):
+    if needs.rare_style_precinct_pairs:
+        for pair in needs.rare_style_precinct_pairs:
+            for ballot in db.ballots_by_style_precinct.get(pair, []):
                 cvr_num = ballot[0].strip()
                 if cvr_num not in initial_rare_cvr_nums:
                     initial_rare_cvr_nums.add(cvr_num)
@@ -1134,9 +1234,15 @@ def perform_redaction(
 
     # Build aggregate (Rules a, b, d).
     aggregate = build_aggregate(rare_ballots, rare_contests, pool, db, min_ballots)
+    borrowed_after_rules_ab = aggregate.total_count() - len(initial_rare_cvr_nums)
+    print()
+    print(f"  Ballots borrowed for minimum counts: {borrowed_after_rules_ab}")
 
-    # Add contrasting ballots if needed (Rule c: no near-unanimity).
+    # Add contrasting ballots if needed to prevent near-unanimity.
+    print("\n*** Balancing near-unanimous contests.\n")
     balance_unanimity(aggregate, pool, db)
+    borrowed_after_rule_c = aggregate.total_count() - len(initial_rare_cvr_nums)
+    print(f"  Ballots borrowed after unanimity balancing: {borrowed_after_rule_c}")
 
     # Record which CvrNumbers ended up in the aggregate (rare + borrowed).
     aggregated_cvr_nums: Set[str] = {
@@ -1144,6 +1250,9 @@ def perform_redaction(
     }
 
     # Build the aggregate row and verify tally.
+    print(
+        "\n*** Verifying that vote tallies match between original and redacted files.\n"
+    )
     aggregate_row = _build_aggregate_row(aggregate.ballots, db, "AGGREGATED")
     _verify_redaction_tally(db, aggregated_cvr_nums, aggregate_row)
 
@@ -1169,7 +1278,7 @@ def perform_redaction(
 
     initial_count = len(initial_rare_cvr_nums)
     borrowed_count = len(aggregated_cvr_nums) - initial_count
-    print("Redaction complete.")
+    print("\n*** Redaction complete.")
     print(f"  Ballots from rare styles/precincts: {initial_count}")
     if borrowed_count > 0:
         print(f"  Ballots borrowed from common styles: {borrowed_count}")
@@ -1277,6 +1386,16 @@ def main() -> None:
             file=sys.stderr,
         )
 
+    print("*** Determining if redaction is needed.")
+    print()
+    if args.redact_on_precinct:
+        print(
+            "*** Looking for rare ballot styles and rare precinct/style combinations."
+        )
+    else:
+        print("*** Looking for rare ballot styles.")
+    print()
+
     # Determine what redaction is needed.
     needs = check_redaction_needs(db, args.min_ballots)
 
@@ -1284,37 +1403,49 @@ def main() -> None:
     for warning in needs.leakage_warnings:
         print(f"WARNING: {warning}", file=sys.stderr)
 
-    if args.check:
-        if needs.needs_redaction():
-            print("Redaction needed.")
-            if needs.rare_styles:
-                total_styles = len(db.ballots_by_style)
-                print(
-                    f"\n  Rare ballot styles "
-                    f"({len(needs.rare_styles)} of {total_styles} total):"
-                )
-                # Sort by ballot count, fewest first.
-                for style, count in sorted(
-                    needs.rare_styles.items(), key=lambda item: item[1]
-                ):
-                    description = f"{count} ballot(s), {style.count('1')} contest(s)"
-                    # Add ballot type(s) as a human-readable identifier, if available.
-                    ballot_types = db.ballot_types_by_style.get(style, set())
-                    if ballot_types:
-                        types_str = ", ".join(f'"{t}"' for t in sorted(ballot_types))
-                        description += f"  [ballot type: {types_str}]"
-                    print(f"    {description}")
+    # Print rare styles and rare (precinct, style) pairs.
+    if needs.rare_styles:
+        total_styles = len(db.ballots_by_style)
+        print(
+            f"  Rare ballot styles ({len(needs.rare_styles)} of {total_styles} total):"
+        )
+        # Sort by ballot count, fewest first.
+        for style, count in sorted(needs.rare_styles.items(), key=lambda item: item[1]):
+            description = f"{count} ballot(s), {style.count('1')} contest(s)"
+            ballot_types = db.ballot_types_by_style.get(style, set())
+            if ballot_types:
+                types_str = ", ".join(f'"{t}"' for t in sorted(ballot_types))
+                description += f"  [ballot type: {types_str}]"
+            print(f"    {description}")
 
-            if needs.rare_precincts:
-                print(f"\n  Rare precincts ({len(needs.rare_precincts)}):")
-                for precinct, count in sorted(
-                    needs.rare_precincts.items(), key=lambda item: item[1]
-                ):
-                    print(f'    "{precinct}": {count} ballot(s)')
-        else:
-            print("No redaction needed.")
+    if needs.rare_style_precinct_pairs:
+        print(
+            f"\n  Rare (precinct, style) pairs "
+            f"({len(needs.rare_style_precinct_pairs)}): CvrNumber(s)"
+        )
+        for (style, precinct), count in sorted(
+            needs.rare_style_precinct_pairs.items(), key=lambda item: item[1]
+        ):
+            ballot_types = db.ballot_types_by_style.get(style, set())
+            if ballot_types:
+                style_desc = ", ".join(f'"{t}"' for t in sorted(ballot_types))
+                style_desc = f"style: {style_desc}"
+            else:
+                style_desc = style
+            pair_ballots = db.ballots_by_style_precinct.get((style, precinct), [])
+            cvr_list = ", ".join(b[0].strip() for b in pair_ballots)
+            print(f'    precinct "{precinct}", {style_desc}: {cvr_list}')
+
+    # Print conclusion.
+    if needs.needs_redaction():
+        print("\nRedaction needed.")
+    else:
+        print("No redaction needed.")
+
+    if args.check:
         return
 
+    print("\n*** Beginning redaction.\n")
     # Redaction mode.
     try:
         perform_redaction(
