@@ -335,7 +335,8 @@ class CvrDatabase:
             if self.ballot_type_idx is not None:
                 ballot_type = ballot[self.ballot_type_idx].strip()
                 by_ballot_type[ballot_type].append(ballot)
-                ballot_types_by_style[style].add(ballot_type)
+                if ballot_type:
+                    ballot_types_by_style[style].add(ballot_type)
 
             if self.redact_on_precinct and self.precinct_portion_idx is not None:
                 precinct = ballot[self.precinct_portion_idx].strip()
