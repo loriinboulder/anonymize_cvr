@@ -874,13 +874,19 @@ def build_aggregate(
     aggregate = Aggregate(rare_ballots, rare_contests, db, min_ballots)
 
     if not aggregate.satisfies_minimums():
+        print(f"  Rare ballots: {aggregate.total_count()}.")
+        print("  Borrowing from common styles to satisfy these requirements:")
         print(
-            f"  Rare ballots: {aggregate.total_count()}.  Borrowing from common styles:"
+            f"  - the ballot aggregation must contain at least {min_ballots} ballots."
         )
-        _print_borrowing_needs(aggregate, min_ballots)
-        print()
         print(
-            "  Selecting ballots to borrow from common styles (this can take a few minutes)..."
+            f"  - every contest in the rare styles must appear on at least"
+            f" {min_ballots} ballots in the aggregation."
+        )
+        print()
+        _print_borrowing_needs(aggregate, min_ballots)
+        print(
+            "\n  Selecting ballots to borrow from common styles (this can take a few minutes)..."
         )
 
     borrowed_cvr_nums: List[str] = []
@@ -942,6 +948,7 @@ def balance_unanimity(
             problematic.append((contest_name, max_choice, max_votes, total_votes))
 
     if not problematic:
+        print("  There are no near-unanimous contests.")
         return
 
     for contest_name, max_choice, max_votes, total_votes in problematic:
@@ -1235,11 +1242,14 @@ def perform_redaction(
     # Build aggregate (Rules a, b, d).
     aggregate = build_aggregate(rare_ballots, rare_contests, pool, db, min_ballots)
     borrowed_after_rules_ab = aggregate.total_count() - len(initial_rare_cvr_nums)
-    print()
-    print(f"  Ballots borrowed for minimum counts: {borrowed_after_rules_ab}")
+    print(f"\n  Ballots borrowed for minimum counts: {borrowed_after_rules_ab}")
 
     # Add contrasting ballots if needed to prevent near-unanimity.
     print("\n*** Balancing near-unanimous contests.\n")
+    print("  Make sure that the following constraint is met:")
+    print("  - No contest in the aggregate may be near-unanimous. 'Near-unanimous'")
+    print(f"    means all but {NEAR_UNANIMOUS_THRESHOLD} votes go to a single choice.")
+    print()
     balance_unanimity(aggregate, pool, db)
     borrowed_after_rule_c = aggregate.total_count() - len(initial_rare_cvr_nums)
     print(f"  Ballots borrowed after unanimity balancing: {borrowed_after_rule_c}")
@@ -1438,7 +1448,7 @@ def main() -> None:
 
     # Print conclusion.
     if needs.needs_redaction():
-        print("\nRedaction needed.")
+        print("\nRedaction is needed.")
     else:
         print("No redaction needed.")
 
