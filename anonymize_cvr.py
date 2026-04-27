@@ -27,7 +27,7 @@ import sys
 from collections import defaultdict
 from typing import Dict, List, Optional, Set, Tuple
 
-from cvr_utils import TempCVRFile
+from cvr_utils import TempCVRFile, convert_parquet_to_csv_format, is_parquet_file
 
 MIN_BALLOTS_DEFAULT = 10
 NEAR_UNANIMOUS_THRESHOLD = 2  # "all but N votes" triggers balancing (Rule c)
@@ -1361,11 +1361,21 @@ def parse_args() -> argparse.Namespace:
         metavar="N",
         help="Column index (0-based) of the named_style field, if present.",
     )
+    parser.add_argument(
+        "--save-csv",
+        metavar="FILENAME",
+        default=None,
+        help=(
+            "Convert a Hive-partitioned parquet input to a single CSV file and exit. "
+            "Use this to cache the unified CSV so subsequent runs skip the conversion."
+        ),
+    )
     args = parser.parse_args()
-    if args.check and args.output_file is not None:
-        parser.error("output_file cannot be specified in --check mode.")
-    if not args.check and args.output_file is None:
-        parser.error("output_file is required when not in --check mode.")
+    if args.save_csv is None:
+        if args.check and args.output_file is not None:
+            parser.error("output_file cannot be specified in --check mode.")
+        if not args.check and args.output_file is None:
+            parser.error("output_file is required when not in --check mode.")
     return args
 
 
@@ -1376,6 +1386,17 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+
+    # --save-csv: convert parquet directory to a single CSV file, then exit.
+    if args.save_csv is not None:
+        if not is_parquet_file(args.input_file):
+            print(
+                "Error: --save-csv requires a parquet or parquet directory input.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        convert_parquet_to_csv_format(args.input_file, args.save_csv)
+        sys.exit(0)
 
     # Load the CVR file.
     try:
