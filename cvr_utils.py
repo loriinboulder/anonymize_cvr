@@ -107,10 +107,16 @@ def _write_voter_rows(
     contests: List[str],
     contest_candidates: Dict[str, List[str]],
     starting_idx: int,
+    ballot_contest_set: Optional[set] = None,
 ) -> int:
     """
     Write one CSV row per voter from an already-filtered (isVote=True) DataFrame.
     Returns the updated CvrNumber counter after writing all voters.
+
+    ballot_contest_set, if provided, is the set of all contests on the ballot for
+    every voter in this batch, determined from all rows including isVote=False
+    (undervotes and overvotes).  When omitted, contest presence is derived from
+    the voted rows alone, which incorrectly marks undervoted contests as absent.
     """
     idx = starting_idx
     for voter_id, voter_votes in votes_df.groupby("voter_id"):
@@ -120,7 +126,10 @@ def _write_voter_rows(
 
         precinct_portion = str(int(voter_votes["precinctPortionId"].iloc[0]))
         voted_pairs = set(zip(voter_votes["contest"], voter_votes["candidate"]))
-        voter_contest_set = set(voter_votes["contest"])
+        if ballot_contest_set is not None:
+            voter_contest_set = ballot_contest_set
+        else:
+            voter_contest_set = set(voter_votes["contest"])
 
         row = [
             str(idx),  # CvrNumber
@@ -189,13 +198,16 @@ def convert_parquet_to_csv_format(parquet_file: str, csv_output: str) -> None:
                 f"Parquet file missing required columns: {missing_cols}. "
                 f"Found columns: {list(df.columns)}"
             )
+        ballot_contest_set = set(df["contest"].unique())
         votes_df = df[df["isVote"]].copy()
         del df
         contest_candidates = {}
-        for contest in sorted(votes_df["contest"].unique()):
-            contest_candidates[contest] = sorted(
+        for contest in sorted(ballot_contest_set):
+            candidates = sorted(
                 votes_df[votes_df["contest"] == contest]["candidate"].unique()
             )
+            if candidates:
+                contest_candidates[contest] = candidates
         contests = list(contest_candidates.keys())
         version_row, contests_row, choices_row, headers_row = _build_header_rows(
             contest_candidates
@@ -209,7 +221,14 @@ def convert_parquet_to_csv_format(parquet_file: str, csv_output: str) -> None:
             writer.writerow(contests_row)
             writer.writerow(choices_row)
             writer.writerow(headers_row)
-            _write_voter_rows(writer, votes_df, contests, contest_candidates, 0)
+            _write_voter_rows(
+                writer,
+                votes_df,
+                contests,
+                contest_candidates,
+                0,
+                ballot_contest_set=ballot_contest_set,
+            )
         print("Done.", flush=True)
         return
 
@@ -253,10 +272,16 @@ def convert_parquet_to_csv_format(parquet_file: str, csv_output: str) -> None:
         for i, pf in enumerate(partition_files, 1):
             print(f"  Partition {i}/{len(partition_files)}: {pf}", flush=True)
             part_df = pd.read_parquet(pf)
+            partition_contest_set = set(part_df["contest"].unique())
             votes_part = part_df[part_df["isVote"]].copy()
             del part_df
             idx = _write_voter_rows(
-                writer, votes_part, contests, contest_candidates, idx
+                writer,
+                votes_part,
+                contests,
+                contest_candidates,
+                idx,
+                ballot_contest_set=partition_contest_set,
             )
             del votes_part
 
