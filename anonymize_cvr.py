@@ -211,15 +211,22 @@ class RowIndex:
 
     def __init__(self) -> None:
         # (style_string, precinct) -> list of row indices
-        self.rows_by_style_precinct: Dict[Tuple[str, str], List[int]] = {}
-        # style string per row index; None for skip rows
-        self.style_for_row: List[Optional[str]] = []
+        self.rows_by_privacy_unit: Dict[Tuple[str, str], List[int]] = {}
+        # table of unique style strings; index into this list is the style ID
+        self.style_strings: List[str] = []
+        # style ID (index into style_strings) per row index; None for skip rows
+        self.style_id_for_row: List[Optional[int]] = []
         # named_style value -> list of row indices (only when --stylecol is given)
         self.rows_by_named_style: Dict[str, List[int]] = {}
         # ballot_type value -> list of row indices (only when BallotType column exists)
         self.rows_by_ballot_type: Dict[str, List[int]] = {}
         # total non-empty rows counted (includes skip rows)
         self.total_rows: int = 0
+
+    def style_for_row(self, row_idx: int) -> Optional[str]:
+        """Return the style string for a row, or None if the row was skipped."""
+        style_id = self.style_id_for_row[row_idx]
+        return None if style_id is None else self.style_strings[style_id]
 
 
 def _should_skip_row(row: List[str], db: CvrDatabase) -> bool:
@@ -275,7 +282,8 @@ def build_row_index(
     indices are consistent across all three passes.
     """
     index = RowIndex()
-    by_style_precinct: Dict[Tuple[str, str], List[int]] = defaultdict(list)
+    style_table: Dict[str, int] = {}  # style_string -> style ID (index into style_strings)
+    by_privacy_unit: Dict[Tuple[str, str], List[int]] = defaultdict(list)
     by_named_style: Dict[str, List[int]] = defaultdict(list)
     by_ballot_type: Dict[str, List[int]] = defaultdict(list)
 
@@ -286,10 +294,7 @@ def build_row_index(
         for _ in range(4):
             next(reader)
 
-        row_idx = 0
-        for row in reader:
-            if not row:
-                continue
+        for row_idx, row in enumerate(row for row in reader if row):
             if len(row) != expected_cols:
                 raise ValueError(
                     f"Row {row_idx + 5} has {len(row)} columns but contests row "
@@ -301,18 +306,23 @@ def build_row_index(
                         "input file contains already-redacted rows; "
                         "cannot re-redact a previously anonymized file."
                     )
-                index.style_for_row.append(None)
-                row_idx += 1
+                index.style_id_for_row.append(None)
                 continue
 
-            style = _style_for_row(row, db)
-            index.style_for_row.append(style)
+            style_str = _style_for_row(row, db)
+            if style_str not in style_table:
+                style_id = len(index.style_strings)
+                style_table[style_str] = style_id
+                index.style_strings.append(style_str)
+            style_id = style_table[style_str]
+            index.style_id_for_row.append(style_id)
+            style = index.style_strings[style_id]
 
             if redact_on_precinct and db.precinct_portion_idx is not None:
                 precinct = row[db.precinct_portion_idx].strip()
             else:
                 precinct = ""
-            by_style_precinct[(style, precinct)].append(row_idx)
+            by_privacy_unit[(style, precinct)].append(row_idx)
 
             if db.named_style_col is not None:
                 named_style = row[db.named_style_col].strip()
@@ -323,10 +333,8 @@ def build_row_index(
                 if ballot_type:
                     by_ballot_type[ballot_type].append(row_idx)
 
-            row_idx += 1
-
-    index.total_rows = row_idx
-    index.rows_by_style_precinct = dict(by_style_precinct)
+    index.total_rows = len(index.style_id_for_row)
+    index.rows_by_privacy_unit = dict(by_privacy_unit)
     index.rows_by_named_style = dict(by_named_style)
     index.rows_by_ballot_type = dict(by_ballot_type)
     return index
@@ -353,19 +361,20 @@ class RedactionNeeds:
         # Key: style string.  Value: ballot count.
         self.rare_styles: Dict[str, int] = {}
 
-        # (style, precinct) pairs with too few ballots.
-        # Only populated when --redact-on-precinct is requested.
+        # Privacy units (style, precinct) with too few ballots.
+        # When --redact-on-precinct is False, precinct is always "" so each key
+        # is (style, "") and the unit is equivalent to the style alone.
         # Per C.R.S. 24-72-205.5, the privacy unit is the combination of contest
         # pattern and precinct, not each independently.
         # Key: (style string, PrecinctPortion value).  Value: ballot count.
-        self.rare_style_precinct_pairs: Dict[Tuple[str, str], int] = {}
+        self.rare_privacy_unit_pairs: Dict[Tuple[str, str], int] = {}
 
         # Human-readable leakage warnings.  Leakage is reported but not corrected.
         self.leakage_warnings: List[str] = []
 
     def needs_redaction(self) -> bool:
         """Return True if any redaction work is required."""
-        return len(self.rare_styles) > 0 or len(self.rare_style_precinct_pairs) > 0
+        return len(self.rare_styles) > 0 or len(self.rare_privacy_unit_pairs) > 0
 
 
 # ---------------------------------------------------------------------------
@@ -397,19 +406,19 @@ def check_redaction_needs(
     # When redact_on_precinct is False, all precincts are "" so each style has
     # exactly one key and the sum equals the style's total ballot count.
     style_totals: Dict[str, int] = defaultdict(int)
-    for (style, precinct), row_indices in index.rows_by_style_precinct.items():
+    for (style, precinct), row_indices in index.rows_by_privacy_unit.items():
         style_totals[style] += len(row_indices)
 
     for style, total in style_totals.items():
         if total < min_ballots:
             needs.rare_styles[style] = total
 
-    # Always populate rare_style_precinct_pairs.
+    # Always populate rare_privacy_unit_pairs.
     # When redact_on_precinct is False, all precincts are "" so each key is
     # (style, "") and the count equals the style's total ballot count.
-    for (style, precinct), row_indices in index.rows_by_style_precinct.items():
+    for (style, precinct), row_indices in index.rows_by_privacy_unit.items():
         if len(row_indices) < min_ballots:
-            needs.rare_style_precinct_pairs[(style, precinct)] = len(row_indices)
+            needs.rare_privacy_unit_pairs[(style, precinct)] = len(row_indices)
 
     # Leakage detection (Rule 10): use named_style if --stylecol was given,
     # otherwise use ballot_type.  Only one check is run.
@@ -417,7 +426,7 @@ def check_redaction_needs(
         named_styles_by_style: Dict[str, Set[str]] = defaultdict(set)
         for named_style, row_indices in index.rows_by_named_style.items():
             for row_idx in row_indices:
-                row_style = index.style_for_row[row_idx]
+                row_style = index.style_for_row(row_idx)
                 if row_style is not None:
                     named_styles_by_style[row_style].add(named_style)
         for style, named_styles in named_styles_by_style.items():
@@ -430,7 +439,7 @@ def check_redaction_needs(
         ballot_types_by_style: Dict[str, Set[str]] = defaultdict(set)
         for ballot_type, row_indices in index.rows_by_ballot_type.items():
             for row_idx in row_indices:
-                row_style = index.style_for_row[row_idx]
+                row_style = index.style_for_row(row_idx)
                 if row_style is not None:
                     ballot_types_by_style[row_style].add(ballot_type)
         for style, ballot_types in ballot_types_by_style.items():
@@ -487,7 +496,7 @@ class Aggregate:
         self.min_ballots = min_ballots
         self.rare_contests = rare_contests
         self.ballots: List[List[str]] = []
-        self._cvr_numbers: Set[str] = set()
+        self._ballot_ids: Set[int] = set()
 
         # For each contest, how many ballots in the aggregate include that contest.
         self._contest_ballot_counts: Dict[str, int] = defaultdict(int)
@@ -505,9 +514,7 @@ class Aggregate:
     def add(self, ballot: List[str]) -> None:
         """Add a ballot to the aggregate, updating all tracked counts."""
         self.ballots.append(ballot)
-        cvr_num = ballot[0].strip()
-        if cvr_num:
-            self._cvr_numbers.add(cvr_num)
+        self._ballot_ids.add(id(ballot))
 
         for contest_name, col_indices in self._db.contest_to_columns.items():
             present = any(ballot[col_idx].strip() != "" for col_idx in col_indices)
@@ -527,8 +534,8 @@ class Aggregate:
                 counts = self._contest_choice_counts[contest_name]
                 counts[choice_name] = counts.get(choice_name, 0) + increment
 
-    def contains_cvr(self, cvr_num: str) -> bool:
-        return cvr_num in self._cvr_numbers
+    def contains_ballot(self, ballot: List[str]) -> bool:
+        return id(ballot) in self._ballot_ids
 
     def total_count(self) -> int:
         return len(self.ballots)
@@ -584,13 +591,13 @@ class CommonPool:
         self,
         styles: Dict[Tuple[str, str], List[List[str]]],
         min_ballots: int,
-        full_counts: Dict[Tuple[str, str], int],
+        rowcount_by_privacy_unit: Dict[Tuple[str, str], int],
     ) -> None:
         self._styles: Dict[Tuple[str, str], List[List[str]]] = {
             key: list(rows) for key, rows in styles.items()
         }
         self.min_ballots = min_ballots
-        self._full_counts = full_counts
+        self._rowcount_by_privacy_unit = rowcount_by_privacy_unit
         self._removed_counts: Dict[Tuple[str, str], int] = {}
 
     def _surplus(self, key: Tuple[str, str]) -> int:
@@ -598,7 +605,7 @@ class CommonPool:
         How many more ballots this pair can donate while keeping
         full_remaining >= min_ballots.  Positive means donating is allowed.
         """
-        full = self._full_counts.get(key, 0)
+        full = self._rowcount_by_privacy_unit.get(key, 0)
         removed = self._removed_counts.get(key, 0)
         return full - removed - self.min_ballots
 
@@ -620,14 +627,15 @@ class CommonPool:
         if not rows or self._surplus(key) <= 0:
             del self._styles[key]
 
-    def remove_by_cvr_numbers(self, cvr_numbers: Set[str]) -> None:
-        """Remove all ballots whose CvrNumber is in the given set."""
+    def remove_rows(self, rows_to_remove: List[List[str]]) -> None:
+        """Remove all ballots in rows_to_remove from the pool (matched by object identity)."""
+        remove_ids = {id(r) for r in rows_to_remove}
         for key in list(self._styles.keys()):
             rows = self._styles[key]
             remaining = []
             removed_here = 0
             for row in rows:
-                if row[0].strip() in cvr_numbers:
+                if id(row) in remove_ids:
                     removed_here += 1
                 else:
                     remaining.append(row)
@@ -677,8 +685,7 @@ class CommonPool:
             if not self.can_donate(key):
                 continue
             for idx, row in enumerate(rows):
-                cvr_num = row[0].strip()
-                if cvr_num and aggregate.contains_cvr(cvr_num):
+                if aggregate.contains_ballot(row):
                     continue
                 covered = [
                     contest
@@ -716,8 +723,7 @@ class CommonPool:
         if best_key is None:
             return None
         for idx, row in enumerate(self._styles[best_key]):
-            cvr_num = row[0].strip()
-            if cvr_num and aggregate.contains_cvr(cvr_num):
+            if aggregate.contains_ballot(row):
                 continue
             return (best_key, idx, row)
         return None
@@ -920,7 +926,7 @@ def build_aggregate(
             "\n  Selecting ballots to borrow from common styles (this can take a few minutes)..."
         )
 
-    borrowed_cvr_nums: List[str] = []
+    borrowed_count = 0
 
     while not aggregate.satisfies_minimums():
         result = pool.best_candidate_for(aggregate, db)
@@ -934,15 +940,13 @@ def build_aggregate(
                 )
             break
         style_sig, row_idx, ballot = result
-        borrowed_cvr_nums.append(ballot[0].strip())
+        borrowed_count += 1
         aggregate.add(ballot)
         pool.remove(style_sig, row_idx)
 
-    if borrowed_cvr_nums:
+    if borrowed_count:
         print()
-        print(
-            f"  Borrowed {len(borrowed_cvr_nums)} ballot(s): {', '.join(borrowed_cvr_nums)}"
-        )
+        print(f"  Borrowed {borrowed_count} ballot(s).")
 
     return aggregate
 
@@ -990,15 +994,11 @@ def balance_unanimity(
 
     contrasting = find_contrasting_ballots_multi(problematic, pool, db)
     if contrasting:
-        borrowed_cvr_nums = {b[0].strip() for b in contrasting if b[0].strip()}
-        pool.remove_by_cvr_numbers(borrowed_cvr_nums)
+        pool.remove_rows(contrasting)
         for ballot in contrasting:
             aggregate.add(ballot)
         print()
-        print(
-            f"  Borrowed {len(borrowed_cvr_nums)} contrasting ballot(s): "
-            f"{', '.join(sorted(borrowed_cvr_nums))}"
-        )
+        print(f"  Borrowed {len(contrasting)} contrasting ballot(s).")
 
 
 def find_contrasting_ballots_multi(
@@ -1102,39 +1102,40 @@ def load_donor_pool(
         redacted_row_indices  — 0-based row indices of all ballots in the aggregate
         aggregate_row         — the AGGREGATED summary row to append to the output
     """
-    pool_target = 5 * min_ballots
+    per_contest_pool_target = 5 * min_ballots
 
     # Pre-compute how many rows contain each contest.
     # Each (style, precinct) key's style string encodes which contests are present.
     contest_total_counts: Dict[str, int] = defaultdict(int)
-    for (style, _), row_indices in index.rows_by_style_precinct.items():
+    for (style, _), row_indices in index.rows_by_privacy_unit.items():
         count = len(row_indices)
         for i, contest_name in enumerate(db.contest_names):
             if style[i] == "1":
                 contest_total_counts[contest_name] += count
 
-    rare_pair_set: Set[Tuple[str, str]] = set(needs.rare_style_precinct_pairs.keys())
+    rare_privacy_unit_set: Set[Tuple[str, str]] = set(needs.rare_privacy_unit_pairs.keys())
 
     # Rare-ballot contests: any contest present on at least one rare ballot.
     rare_ballot_contests: Set[str] = set()
-    for (style, _) in rare_pair_set:
+    for (style, _) in rare_privacy_unit_set:
         for i, contest_name in enumerate(db.contest_names):
             if style[i] == "1":
                 rare_ballot_contests.add(contest_name)
 
-    # Rare contests: rare-ballot contests with fewer than pool_target total appearances.
+    # Rare contests: rare-ballot contests with fewer than per_contest_pool_target
+    # total appearances in the full CVR.
     rare_contests: Set[str] = set()
     for contest_name in rare_ballot_contests:
-        if contest_total_counts[contest_name] < pool_target:
+        if contest_total_counts[contest_name] < per_contest_pool_target:
             rare_contests.add(contest_name)
 
-    # Full counts per pair, passed to CommonPool for Rule d enforcement.
-    full_counts: Dict[Tuple[str, str], int] = {}
-    for key, row_indices in index.rows_by_style_precinct.items():
-        full_counts[key] = len(row_indices)
+    # Row counts per privacy unit, passed to CommonPool for Rule d enforcement.
+    rowcount_by_privacy_unit: Dict[Tuple[str, str], int] = {}
+    for key, row_indices in index.rows_by_privacy_unit.items():
+        rowcount_by_privacy_unit[key] = len(row_indices)
 
     # Tracks how many donor rows have been loaded per rare-ballot contest.
-    donor_count: Dict[str, int] = defaultdict(int)
+    donor_count_by_rare_ballot_contest: Dict[str, int] = defaultdict(int)
 
     # Tracks vote distribution of loaded donors per rare-ballot contest.
     # contest_name -> {choice_name: count of donors voting "1" for that choice}
@@ -1142,42 +1143,33 @@ def load_donor_pool(
     donor_voted_tally: Dict[str, Dict[str, int]] = {}
 
     rare_rows: List[List[str]] = []
-    donor_by_pair: Dict[Tuple[str, str], List[List[str]]] = defaultdict(list)
+    donor_by_privacy_unit: Dict[Tuple[str, str], List[List[str]]] = defaultdict(list)
 
-    # Maps CvrNumber to row_idx for all loaded rows, used to identify aggregated rows.
-    cvr_to_row_idx: Dict[str, int] = {}
+    # Maps id(row) to row_idx for all loaded rows, used to identify aggregated rows.
+    row_to_idx: Dict[int, int] = {}
 
     with open(csv_path, "r", encoding="utf-8") as f:
         reader = csv.reader(f)
         for _ in range(4):
             next(reader)
 
-        row_idx = 0
-        for row in reader:
-            if not row:
-                continue
-
-            row_style = index.style_for_row[row_idx]
+        for row_idx, row in enumerate(row for row in reader if row):
+            row_style = index.style_for_row(row_idx)
             if row_style is None:
-                row_idx += 1
                 continue
 
             if redact_on_precinct and db.precinct_portion_idx is not None:
                 precinct = row[db.precinct_portion_idx].strip()
             else:
                 precinct = ""
-            pair = (row_style, precinct)
+            privacy_unit = (row_style, precinct)
 
-            cvr_num = row[0].strip()
-
-            if pair in rare_pair_set:
+            if privacy_unit in rare_privacy_unit_set:
                 rare_rows.append(row)
-                if cvr_num:
-                    cvr_to_row_idx[cvr_num] = row_idx
+                row_to_idx[id(row)] = row_idx
             else:
-                pair_count = full_counts.get(pair, 0)
-                if pair_count <= min_ballots:
-                    row_idx += 1
+                privacy_unit_count = rowcount_by_privacy_unit.get(privacy_unit, 0)
+                if privacy_unit_count <= min_ballots:
                     continue
 
                 # Find which rare-ballot contests are present on this row.
@@ -1187,10 +1179,9 @@ def load_donor_pool(
                         row_rare_contests.append(contest_name)
 
                 if not row_rare_contests:
-                    row_idx += 1
                     continue
 
-                if pair_count <= min_ballots + DONOR_SURPLUS_THRESHOLD:
+                if privacy_unit_count <= min_ballots + DONOR_SURPLUS_THRESHOLD:
                     # Tight surplus: only load if this row has a rare contest.
                     has_rare_contest = False
                     for contest_name in row_rare_contests:
@@ -1198,7 +1189,6 @@ def load_donor_pool(
                             has_rare_contest = True
                             break
                     if not has_rare_contest:
-                        row_idx += 1
                         continue
                 else:
                     # Comfortable surplus: load if pool needs more donors for any
@@ -1206,7 +1196,7 @@ def load_donor_pool(
                     # for a contest where loaded donors are currently too one-sided.
                     pool_needs_more = False
                     for contest_name in row_rare_contests:
-                        if donor_count[contest_name] < pool_target:
+                        if donor_count_by_rare_ballot_contest[contest_name] < per_contest_pool_target:
                             pool_needs_more = True
                             break
 
@@ -1216,7 +1206,15 @@ def load_donor_pool(
                             tally = donor_voted_tally.get(contest_name, {})
                             if not tally:
                                 continue
-                            max_choice = max(tally, key=lambda c: tally[c])
+
+                            # For this contest, find the choice with the most votes.
+                            max_choice = None
+                            max_count = -1
+                            for choice_name, count in tally.items():
+                                if count > max_count:
+                                    max_count = count
+                                    max_choice = choice_name
+
                             row_voted = None
                             for col_idx, choice_name in db.contest_choice_meta.get(
                                 contest_name, {}
@@ -1233,14 +1231,12 @@ def load_donor_pool(
                                 needs_contrast = True
                                 break
                         if not needs_contrast:
-                            row_idx += 1
                             continue
 
-                donor_by_pair[pair].append(row)
-                if cvr_num:
-                    cvr_to_row_idx[cvr_num] = row_idx
+                donor_by_privacy_unit[privacy_unit].append(row)
+                row_to_idx[id(row)] = row_idx
                 for contest_name in row_rare_contests:
-                    donor_count[contest_name] += 1
+                    donor_count_by_rare_ballot_contest[contest_name] += 1
                     tally = donor_voted_tally.setdefault(contest_name, {})
                     for col_idx, choice_name in db.contest_choice_meta.get(
                         contest_name, {}
@@ -1249,9 +1245,7 @@ def load_donor_pool(
                             tally[choice_name] = tally.get(choice_name, 0) + 1
                             break
 
-            row_idx += 1
-
-    pool = CommonPool(dict(donor_by_pair), min_ballots, full_counts)
+    pool = CommonPool(dict(donor_by_privacy_unit), min_ballots, rowcount_by_privacy_unit)
 
     print("*** Pass 2: Building aggregate.")
     print()
@@ -1269,12 +1263,12 @@ def load_donor_pool(
     borrowed_after_c = aggregate.total_count() - len(rare_rows)
     print(f"  Ballots borrowed after unanimity balancing: {borrowed_after_c}")
 
-    # Identify which row indices are in the aggregate by looking up CvrNumbers.
+    # Identify which row indices are in the aggregate by object identity.
     redacted_row_indices: Set[int] = set()
     for ballot in aggregate.ballots:
-        cvr_num = ballot[0].strip()
-        if cvr_num and cvr_num in cvr_to_row_idx:
-            redacted_row_indices.add(cvr_to_row_idx[cvr_num])
+        idx = row_to_idx.get(id(ballot))
+        if idx is not None:
+            redacted_row_indices.add(idx)
 
     aggregate_row = _build_aggregate_row(aggregate.ballots, db, "AGGREGATED")
 
@@ -1306,8 +1300,8 @@ def perform_redaction(
     )
 
     rare_count = 0
-    for key, row_indices in index.rows_by_style_precinct.items():
-        if key in needs.rare_style_precinct_pairs:
+    for key, row_indices in index.rows_by_privacy_unit.items():
+        if key in needs.rare_privacy_unit_pairs:
             rare_count += len(row_indices)
     borrowed_count = len(redacted_row_indices) - rare_count
 
@@ -1464,38 +1458,35 @@ def main() -> None:
         ballot_types_by_style: Dict[str, Set[str]] = defaultdict(set)
         for ballot_type, row_indices in index.rows_by_ballot_type.items():
             for row_idx in row_indices:
-                style = index.style_for_row[row_idx]
+                style = index.style_for_row(row_idx)
                 if style is not None:
                     ballot_types_by_style[style].add(ballot_type)
 
         named_styles_by_style: Dict[str, Set[str]] = defaultdict(set)
         for named_style, row_indices in index.rows_by_named_style.items():
             for row_idx in row_indices:
-                style = index.style_for_row[row_idx]
+                style = index.style_for_row(row_idx)
                 if style is not None:
                     named_styles_by_style[style].add(named_style)
 
-        all_styles: Set[str] = set()
-        for (style, precinct) in index.rows_by_style_precinct.keys():
-            all_styles.add(style)
-        total_styles = len(all_styles)
+        total_styles = len(index.style_strings)
 
         show_precinct = args.redact_on_precinct and db.precinct_portion_idx is not None
 
-        if needs.rare_style_precinct_pairs:
+        if needs.rare_privacy_unit_pairs:
             if show_precinct:
-                total_pairs = len(index.rows_by_style_precinct)
+                total_pairs = len(index.rows_by_privacy_unit)
                 print(
                     f"  Rare ballot style/precinct combinations "
-                    f"({len(needs.rare_style_precinct_pairs)} of {total_pairs} total):"
+                    f"({len(needs.rare_privacy_unit_pairs)} of {total_pairs} total):"
                 )
             else:
                 print(
                     f"  Rare ballot styles "
-                    f"({len(needs.rare_style_precinct_pairs)} of {total_styles} total):"
+                    f"({len(needs.rare_privacy_unit_pairs)} of {total_styles} total):"
                 )
             for (style, precinct), count in sorted(
-                needs.rare_style_precinct_pairs.items(), key=lambda item: item[1]
+                needs.rare_privacy_unit_pairs.items(), key=lambda item: item[1]
             ):
                 ballot_types = ballot_types_by_style.get(style, set())
                 named_styles_for_style = named_styles_by_style.get(style, set())
@@ -1523,6 +1514,7 @@ def main() -> None:
         if args.check:
             return
 
+        # Pass 2 and 3.
         perform_redaction(
             csv_path,
             db,
