@@ -130,7 +130,9 @@ def verify(original_path: str, redacted_path: str) -> bool:
                             )
                             row_errors += 1
                             if row_errors >= MAX_ERRORS:
-                                print("Too many errors; stopping early.", file=sys.stderr)
+                                print(
+                                    "Too many errors; stopping early.", file=sys.stderr
+                                )
                                 return False
 
                 row_idx += 1

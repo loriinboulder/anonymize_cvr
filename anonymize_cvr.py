@@ -33,7 +33,9 @@ MIN_BALLOTS_DEFAULT = 10
 NEAR_UNANIMOUS_THRESHOLD = 2  # "all but N votes" triggers balancing (Rule c)
 MIN_CONTRASTING_VOTES = 3  # contrasting votes needed per contest after balancing
 COVERAGE_WEIGHT = 10.0  # weight for contest coverage vs. vote-balance score
-DONOR_SURPLUS_THRESHOLD = 3  # minimum surplus above min_ballots for a style/precinct to donate freely
+DONOR_SURPLUS_THRESHOLD = (
+    3  # minimum surplus above min_ballots for a style/precinct to donate freely
+)
 
 
 # ---------------------------------------------------------------------------
@@ -282,7 +284,9 @@ def build_row_index(
     indices are consistent across all three passes.
     """
     index = RowIndex()
-    style_table: Dict[str, int] = {}  # style_string -> style ID (index into style_strings)
+    style_table: Dict[str, int] = (
+        {}
+    )  # style_string -> style ID (index into style_strings)
     by_privacy_unit: Dict[Tuple[str, str], List[int]] = defaultdict(list)
     by_named_style: Dict[str, List[int]] = defaultdict(list)
     by_ballot_type: Dict[str, List[int]] = defaultdict(list)
@@ -642,7 +646,9 @@ class CommonPool:
                 else:
                     remaining.append(row)
             if removed_here > 0:
-                self._removed_counts[key] = self._removed_counts.get(key, 0) + removed_here
+                self._removed_counts[key] = (
+                    self._removed_counts.get(key, 0) + removed_here
+                )
             if not remaining or self._surplus(key) <= 0:
                 del self._styles[key]
             else:
@@ -963,7 +969,9 @@ def build_aggregate(
     return aggregate
 
 
-def _find_near_unanimous_contests(aggregate: Aggregate) -> List[Tuple]:
+def _find_near_unanimous_contests(
+    aggregate: Aggregate,
+) -> List[Tuple[str, Optional[str], int, int]]:
     """
     Return (contest_name, max_choice, max_votes, total_votes) for every rare contest
     in the aggregate that is near-unanimous.
@@ -1027,7 +1035,7 @@ def balance_unanimity(
 
 
 def find_contrasting_ballots_multi(
-    problematic_contests: List[Tuple],
+    problematic_contests: List[Tuple[str, Optional[str], int, int]],
     pool: CommonPool,
     db: CvrDatabase,
 ) -> List[List[str]]:
@@ -1138,11 +1146,13 @@ def load_donor_pool(
             if style[i] == "1":
                 contest_total_counts[contest_name] += count
 
-    rare_privacy_unit_set: Set[Tuple[str, str]] = set(needs.rare_privacy_unit_pairs.keys())
+    rare_privacy_unit_set: Set[Tuple[str, str]] = set(
+        needs.rare_privacy_unit_pairs.keys()
+    )
 
     # Rare-ballot contests: any contest present on at least one rare ballot.
     rare_ballot_contests: Set[str] = set()
-    for (style, _) in rare_privacy_unit_set:
+    for style, _ in rare_privacy_unit_set:
         for i, contest_name in enumerate(db.contest_names):
             if style[i] == "1":
                 rare_ballot_contests.add(contest_name)
@@ -1223,7 +1233,10 @@ def load_donor_pool(
                     # for a contest where loaded donors are currently too one-sided.
                     pool_needs_more = False
                     for contest_name in row_rare_contests:
-                        if donor_count_by_rare_ballot_contest[contest_name] < per_contest_pool_target:
+                        if (
+                            donor_count_by_rare_ballot_contest[contest_name]
+                            < per_contest_pool_target
+                        ):
                             pool_needs_more = True
                             break
 
@@ -1273,7 +1286,9 @@ def load_donor_pool(
                             tally[choice_name] = tally.get(choice_name, 0) + 1
                             break
 
-    pool = CommonPool(dict(donor_by_privacy_unit), min_ballots, rowcount_by_privacy_unit)
+    pool = CommonPool(
+        dict(donor_by_privacy_unit), min_ballots, rowcount_by_privacy_unit
+    )
 
     print("*** Pass 2: Building aggregate.")
     print()
@@ -1307,9 +1322,7 @@ def load_donor_pool(
         print(
             "  Warning: the following contests remain near-unanimous after balancing."
         )
-        print(
-            "  No contrasting ballots were available in the donor pool."
-        )
+        print("  No contrasting ballots were available in the donor pool.")
         for contest_name, max_choice, max_votes, total_votes in still_problematic:
             print(
                 f"    '{contest_name}': '{max_choice}' has "
@@ -1385,7 +1398,9 @@ def _stream_redacted_output(
                     print(f"  {row_idx:,} rows written...", flush=True)
                 _add_to_tally(pre_tally, row, db.headerlen)
                 if row_idx in redacted_row_indices:
-                    writer.writerow(_remove_columns(_redact_ballot_row(row, db), cols_to_remove))
+                    writer.writerow(
+                        _remove_columns(_redact_ballot_row(row, db), cols_to_remove)
+                    )
                 else:
                     out_row = _blank_geographic_fields(row, db, redact_on_precinct)
                     writer.writerow(_remove_columns(out_row, cols_to_remove))
@@ -1421,7 +1436,9 @@ def perform_redaction(
 ) -> None:
     """Orchestrate passes 2 and 3 to produce the anonymized CVR."""
     if needs.needs_redaction():
-        result = load_donor_pool(csv_path, index, needs, db, min_ballots, redact_on_precinct)
+        result = load_donor_pool(
+            csv_path, index, needs, db, min_ballots, redact_on_precinct
+        )
         redacted_row_indices: Set[int] = result[0]
         aggregate_row: Optional[List[str]] = result[1]
 
@@ -1442,7 +1459,12 @@ def perform_redaction(
 
     print("\n*** Pass 3: Writing output.")
     _stream_redacted_output(
-        csv_path, db, output_file, redacted_row_indices, aggregate_row, redact_on_precinct
+        csv_path,
+        db,
+        output_file,
+        redacted_row_indices,
+        aggregate_row,
+        redact_on_precinct,
     )
     print(f"  Output written to {output_file}.")
 
@@ -1569,7 +1591,9 @@ def main() -> None:
         print("*** Pass 1: Building row index.")
         print()
         try:
-            index = build_row_index(csv_path, db, args.redact_on_precinct, check_mode=args.check)
+            index = build_row_index(
+                csv_path, db, args.redact_on_precinct, check_mode=args.check
+            )
         except (ValueError, OSError) as e:
             print(f"Error building row index: {e}", file=sys.stderr)
             sys.exit(1)
@@ -1582,7 +1606,9 @@ def main() -> None:
             print("*** Looking for rare ballot styles.")
         print()
 
-        needs = check_redaction_needs(index, db, args.min_ballots, args.redact_on_precinct)
+        needs = check_redaction_needs(
+            index, db, args.min_ballots, args.redact_on_precinct
+        )
 
         for warning in needs.leakage_warnings:
             print(f"WARNING: {warning}", file=sys.stderr)
@@ -1632,9 +1658,15 @@ def main() -> None:
                 if show_precinct:
                     parts.append(f'precinct "{precinct}"')
                 if ballot_types:
-                    parts.append("ballot type: " + ", ".join(f'"{t}"' for t in sorted(ballot_types)))
+                    parts.append(
+                        "ballot type: "
+                        + ", ".join(f'"{t}"' for t in sorted(ballot_types))
+                    )
                 elif named_styles_for_style:
-                    parts.append("named style: " + ", ".join(f'"{n}"' for n in sorted(named_styles_for_style)))
+                    parts.append(
+                        "named style: "
+                        + ", ".join(f'"{n}"' for n in sorted(named_styles_for_style))
+                    )
                 parts.append(f"style #{style_to_id[style]}")
 
                 print(f"    {count} ballot(s)  [{', '.join(parts)}]")
