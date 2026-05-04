@@ -1618,26 +1618,26 @@ def main() -> None:
                     f"  Rare ballot styles "
                     f"({len(needs.rare_privacy_unit_pairs)} of {total_styles} total):"
                 )
+            style_to_id = {}
+            for i, s in enumerate(index.style_strings):
+                style_to_id[s] = i
+
             for (style, precinct), count in sorted(
                 needs.rare_privacy_unit_pairs.items(), key=lambda item: item[1]
             ):
                 ballot_types = ballot_types_by_style.get(style, set())
                 named_styles_for_style = named_styles_by_style.get(style, set())
-                if ballot_types:
-                    style_id = "ballot type: " + ", ".join(f'"{t}"' for t in sorted(ballot_types))
-                elif named_styles_for_style:
-                    style_id = "named style: " + ", ".join(
-                        f'"{n}"' for n in sorted(named_styles_for_style)
-                    )
-                else:
-                    style_id = style
-                contests = style.count("1")
-                description = f"{count} ballot(s), {contests} contest(s)"
+
+                parts = []
                 if show_precinct:
-                    description += f'  [precinct "{precinct}", {style_id}]'
-                else:
-                    description += f"  [{style_id}]"
-                print(f"    {description}")
+                    parts.append(f'precinct "{precinct}"')
+                if ballot_types:
+                    parts.append("ballot type: " + ", ".join(f'"{t}"' for t in sorted(ballot_types)))
+                elif named_styles_for_style:
+                    parts.append("named style: " + ", ".join(f'"{n}"' for n in sorted(named_styles_for_style)))
+                parts.append(f"style #{style_to_id[style]}")
+
+                print(f"    {count} ballot(s)  [{', '.join(parts)}]")
 
         if needs.needs_redaction():
             print("\nRedaction is needed.")
