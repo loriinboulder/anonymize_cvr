@@ -839,6 +839,16 @@ def _build_aggregate_row(
     return result
 
 
+def _remove_columns(row: List[str], cols_to_remove: List[int]) -> List[str]:
+    """Return a copy of row with the specified column indices omitted."""
+    remove_set = set(cols_to_remove)
+    result = []
+    for i, val in enumerate(row):
+        if i not in remove_set:
+            result.append(val)
+    return result
+
+
 def _redact_ballot_row(ballot: List[str], db: CvrDatabase) -> List[str]:
     """
     Return a copy of the ballot with all vote columns replaced by '*'.
@@ -953,6 +963,37 @@ def build_aggregate(
     return aggregate
 
 
+def _find_near_unanimous_contests(aggregate: Aggregate) -> List[Tuple]:
+    """
+    Return (contest_name, max_choice, max_votes, total_votes) for every rare contest
+    in the aggregate that is near-unanimous.
+
+    Contests with only one choice are excluded: they are always unanimous by
+    definition and there is nothing that can be done about it.
+    """
+    result = []
+    for contest_name, choice_votes in aggregate.choice_counts().items():
+        if contest_name not in aggregate.rare_contests:
+            continue
+        if not choice_votes:
+            continue
+        if len(choice_votes) <= 1:
+            continue
+        total_votes = sum(choice_votes.values())
+        if total_votes == 0:
+            continue
+        max_choice = None
+        max_votes = 0
+        for choice, votes in choice_votes.items():
+            if votes > max_votes:
+                max_votes = votes
+                max_choice = choice
+        other_votes = total_votes - max_votes
+        if other_votes <= NEAR_UNANIMOUS_THRESHOLD:
+            result.append((contest_name, max_choice, max_votes, total_votes))
+    return result
+
+
 def balance_unanimity(
     aggregate: Aggregate,
     pool: CommonPool,
@@ -964,25 +1005,7 @@ def balance_unanimity(
     Only checks contests that appeared on rare ballots; near-unanimity in
     contests that belong only to common styles is not a concern here.
     """
-    contest_totals = aggregate.choice_counts()
-
-    # Construct a list of contests that are in the "near-unamimous" condition.
-    # That is, find contests whose top vote-holder is within NEAR_UNANIMOUS_THRESHOLD
-    # votes of the total votes in the contest.
-    problematic: List[Tuple] = []
-    for contest_name, choice_votes in contest_totals.items():
-        if contest_name not in aggregate.rare_contests:
-            continue
-        if not choice_votes:
-            continue
-        total_votes = sum(choice_votes.values())
-        if total_votes == 0:
-            continue
-        max_choice = max(choice_votes, key=lambda c: choice_votes[c])
-        max_votes = choice_votes[max_choice]
-        other_votes = total_votes - max_votes
-        if other_votes <= NEAR_UNANIMOUS_THRESHOLD:
-            problematic.append((contest_name, max_choice, max_votes, total_votes))
+    problematic = _find_near_unanimous_contests(aggregate)
 
     if not problematic:
         print("  There are no near-unanimous contests.")
@@ -1104,7 +1127,7 @@ def load_donor_pool(
         redacted_row_indices  — 0-based row indices of all ballots in the aggregate
         aggregate_row         — the AGGREGATED summary row to append to the output
     """
-    per_contest_pool_target = 5 * min_ballots
+    per_contest_pool_target = 10 * min_ballots
 
     # Pre-compute how many rows contain each contest.
     # Each (style, precinct) key's style string encodes which contests are present.
@@ -1228,9 +1251,10 @@ def load_donor_pool(
                                     break
                             if row_voted is None or row_voted == max_choice:
                                 continue
-                            contrasting_so_far = sum(
-                                v for c, v in tally.items() if c != max_choice
-                            )
+                            contrasting_so_far = 0
+                            for c, v in tally.items():
+                                if c != max_choice:
+                                    contrasting_so_far += v
                             if contrasting_so_far < MIN_CONTRASTING_VOTES:
                                 needs_contrast = True
                                 break
@@ -1263,9 +1287,34 @@ def load_donor_pool(
     print("  - No contest in the aggregate may be near-unanimous. 'Near-unanimous'")
     print(f"    means all but {NEAR_UNANIMOUS_THRESHOLD} votes go to a single choice.")
     print()
-    balance_unanimity(aggregate, pool, db)
+    # Loop until no near-unanimous contests remain or the pool is exhausted.
+    # Each pass either adds at least one ballot (shrinking the finite pool) or
+    # adds nothing, in which case we are stuck and exit.  Termination is guaranteed.
+    while True:
+        count_before = aggregate.total_count()
+        balance_unanimity(aggregate, pool, db)
+        still_problematic = _find_near_unanimous_contests(aggregate)
+        if not still_problematic:
+            break
+        if aggregate.total_count() == count_before:
+            break  # balance_unanimity could not add any ballots; no point looping
+
     borrowed_after_c = aggregate.total_count() - len(rare_rows)
     print(f"  Ballots borrowed after unanimity balancing: {borrowed_after_c}")
+
+    if still_problematic:
+        print()
+        print(
+            "  Warning: the following contests remain near-unanimous after balancing."
+        )
+        print(
+            "  No contrasting ballots were available in the donor pool."
+        )
+        for contest_name, max_choice, max_votes, total_votes in still_problematic:
+            print(
+                f"    '{contest_name}': '{max_choice}' has "
+                f"{max_votes} out of {total_votes} votes"
+            )
 
     # Identify which row indices are in the aggregate by object identity.
     redacted_row_indices: Set[int] = set()
@@ -1309,6 +1358,16 @@ def _stream_redacted_output(
     post_tally — running sum of vote columns for non-redacted rows, plus the
                  aggregate row.  Must equal pre_tally if redaction is correct.
     """
+    # Columns that carry no information in the output and should be omitted entirely.
+    # CountingGroup is always removed.  PrecinctPortion is removed when not redacting
+    # on precinct, because every row has it blanked in that case.
+    cols_to_remove: List[int] = []
+    if db.counting_group_idx is not None:
+        cols_to_remove.append(db.counting_group_idx)
+    if not redact_on_precinct and db.precinct_portion_idx is not None:
+        cols_to_remove.append(db.precinct_portion_idx)
+    cols_to_remove.sort()
+
     num_vote_cols = len(db.contests) - db.headerlen
     pre_tally: List[float] = [0.0] * num_vote_cols
     post_tally: List[float] = [0.0] * num_vote_cols
@@ -1319,20 +1378,21 @@ def _stream_redacted_output(
             writer = csv.writer(f_out, lineterminator=db.lineterminator)
 
             for _ in range(4):
-                writer.writerow(next(reader))
+                writer.writerow(_remove_columns(next(reader), cols_to_remove))
 
             for row_idx, row in enumerate(r for r in reader if r):
                 if row_idx > 0 and row_idx % 100000 == 0:
                     print(f"  {row_idx:,} rows written...", flush=True)
                 _add_to_tally(pre_tally, row, db.headerlen)
                 if row_idx in redacted_row_indices:
-                    writer.writerow(_redact_ballot_row(row, db))
+                    writer.writerow(_remove_columns(_redact_ballot_row(row, db), cols_to_remove))
                 else:
-                    writer.writerow(_blank_geographic_fields(row, db, redact_on_precinct))
+                    out_row = _blank_geographic_fields(row, db, redact_on_precinct)
+                    writer.writerow(_remove_columns(out_row, cols_to_remove))
                     _add_to_tally(post_tally, row, db.headerlen)
 
             if aggregate_row is not None:
-                writer.writerow(aggregate_row)
+                writer.writerow(_remove_columns(aggregate_row, cols_to_remove))
                 _add_to_tally(post_tally, aggregate_row, db.headerlen)
 
     if aggregate_row is not None:
