@@ -27,8 +27,6 @@ import sys
 from collections import defaultdict
 from typing import Dict, List, Optional, Set, Tuple
 
-from cvr_utils import TempCVRFile, convert_parquet_to_csv_format, is_parquet_file
-
 MIN_BALLOTS_DEFAULT = 10
 NEAR_UNANIMOUS_THRESHOLD = 2  # "all but N votes" triggers balancing (Rule c)
 MIN_CONTRASTING_VOTES = 3  # contrasting votes needed per contest after balancing
@@ -36,6 +34,32 @@ COVERAGE_WEIGHT = 10.0  # weight for contest coverage vs. vote-balance score
 DONOR_SURPLUS_THRESHOLD = (
     3  # minimum surplus above min_ballots for a style/precinct to donate freely
 )
+
+
+# ---------------------------------------------------------------------------
+# TempCVRFile
+# ---------------------------------------------------------------------------
+
+
+class TempCVRFile:
+    """
+    Context manager for CVR input files.  Returns the input path directly;
+    parquet conversion is not supported in this build.
+    """
+
+    def __init__(self, input_path: str) -> None:
+        self.input_path = input_path
+
+    def __enter__(self) -> str:
+        return self.input_path
+
+    def __exit__(
+        self,
+        exc_type: Optional[type],
+        exc_val: Optional[BaseException],
+        exc_tb: Optional[object],
+    ) -> None:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -72,8 +96,7 @@ class CvrDatabase:
         Read the CVR file header and build contest/choice mappings.
 
         Args:
-            input_file:      Path to the CVR CSV file.  The caller must manage
-                             any parquet conversion via TempCVRFile before calling.
+            input_file:      Path to the CVR CSV file.
             headerlen:       Number of header columns before vote data begins.
                              Pass 0 to auto-detect from the contests row.
             named_style_col: Column index of the named_style field, or None.
@@ -1487,7 +1510,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "input_file",
-        help="Path to the input CVR file (CSV or Parquet format).",
+        help="Path to the input CVR file (CSV format).",
     )
     parser.add_argument(
         "output_file",
@@ -1536,21 +1559,11 @@ def parse_args() -> argparse.Namespace:
         metavar="N",
         help="Column index (0-based) of the named_style field, if present.",
     )
-    parser.add_argument(
-        "--save-csv",
-        metavar="FILENAME",
-        default=None,
-        help=(
-            "Convert a Hive-partitioned parquet input to a single CSV file and exit. "
-            "Use this to cache the unified CSV so subsequent runs skip the conversion."
-        ),
-    )
     args = parser.parse_args()
-    if args.save_csv is None:
-        if args.check and args.output_file is not None:
-            parser.error("output_file cannot be specified in --check mode.")
-        if not args.check and args.output_file is None:
-            parser.error("output_file is required when not in --check mode.")
+    if args.check and args.output_file is not None:
+        parser.error("output_file cannot be specified in --check mode.")
+    if not args.check and args.output_file is None:
+        parser.error("output_file is required when not in --check mode.")
     return args
 
 
@@ -1561,17 +1574,6 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-
-    # --save-csv: convert parquet directory to a single CSV file, then exit.
-    if args.save_csv is not None:
-        if not is_parquet_file(args.input_file):
-            print(
-                "Error: --save-csv requires a parquet or parquet directory input.",
-                file=sys.stderr,
-            )
-            sys.exit(1)
-        convert_parquet_to_csv_format(args.input_file, args.save_csv)
-        sys.exit(0)
 
     with TempCVRFile(args.input_file) as csv_path:
         try:
