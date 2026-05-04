@@ -295,6 +295,8 @@ def build_row_index(
             next(reader)
 
         for row_idx, row in enumerate(row for row in reader if row):
+            if row_idx > 0 and row_idx % 100000 == 0:
+                print(f"  {row_idx:,} rows scanned...", flush=True)
             if len(row) != expected_cols:
                 raise ValueError(
                     f"Row {row_idx + 5} has {len(row)} columns but contests row "
@@ -1154,6 +1156,8 @@ def load_donor_pool(
             next(reader)
 
         for row_idx, row in enumerate(row for row in reader if row):
+            if row_idx > 0 and row_idx % 100000 == 0:
+                print(f"  {row_idx:,} rows scanned...", flush=True)
             row_style = index.style_for_row(row_idx)
             if row_style is None:
                 continue
@@ -1275,6 +1279,77 @@ def load_donor_pool(
     return redacted_row_indices, aggregate_row
 
 
+def _add_to_tally(tally: List[float], row: List[str], headerlen: int) -> None:
+    """Add the vote column values from row into tally (in-place)."""
+    for i in range(len(tally)):
+        col_idx = headerlen + i
+        if col_idx >= len(row):
+            continue
+        val = row[col_idx].strip()
+        if val:
+            try:
+                tally[i] += float(val)
+            except ValueError:
+                pass
+
+
+def _stream_redacted_output(
+    csv_path: str,
+    db: CvrDatabase,
+    output_file: str,
+    redacted_row_indices: Set[int],
+    aggregate_row: Optional[List[str]],
+    redact_on_precinct: bool,
+) -> None:
+    """
+    Pass 3: stream input to output, redacting rows in redacted_row_indices,
+    appending the aggregate row (if any), and verifying vote tallies match.
+
+    pre_tally  — running sum of original vote columns for every input row.
+    post_tally — running sum of vote columns for non-redacted rows, plus the
+                 aggregate row.  Must equal pre_tally if redaction is correct.
+    """
+    num_vote_cols = len(db.contests) - db.headerlen
+    pre_tally: List[float] = [0.0] * num_vote_cols
+    post_tally: List[float] = [0.0] * num_vote_cols
+
+    with open(csv_path, "r", encoding="utf-8") as f_in:
+        with open(output_file, "w", encoding="utf-8", newline="") as f_out:
+            reader = csv.reader(f_in)
+            writer = csv.writer(f_out, lineterminator=db.lineterminator)
+
+            for _ in range(4):
+                writer.writerow(next(reader))
+
+            for row_idx, row in enumerate(r for r in reader if r):
+                if row_idx > 0 and row_idx % 100000 == 0:
+                    print(f"  {row_idx:,} rows written...", flush=True)
+                _add_to_tally(pre_tally, row, db.headerlen)
+                if row_idx in redacted_row_indices:
+                    writer.writerow(_redact_ballot_row(row, db))
+                else:
+                    writer.writerow(_blank_geographic_fields(row, db, redact_on_precinct))
+                    _add_to_tally(post_tally, row, db.headerlen)
+
+            if aggregate_row is not None:
+                writer.writerow(aggregate_row)
+                _add_to_tally(post_tally, aggregate_row, db.headerlen)
+
+    if aggregate_row is not None:
+        mismatches = 0
+        for i in range(num_vote_cols):
+            if abs(pre_tally[i] - post_tally[i]) > 0.001:
+                mismatches += 1
+        if mismatches:
+            print(
+                f"Warning: tally mismatch in {mismatches} vote column(s) — "
+                f"redacted output may be incorrect.",
+                file=sys.stderr,
+            )
+        else:
+            print("  Tally verification passed.")
+
+
 def perform_redaction(
     csv_path: str,
     db: CvrDatabase,
@@ -1284,34 +1359,32 @@ def perform_redaction(
     output_file: str,
     redact_on_precinct: bool,
 ) -> None:
-    """
-    Orchestrate passes 2 and 3 to produce the anonymized CVR.
+    """Orchestrate passes 2 and 3 to produce the anonymized CVR."""
+    if needs.needs_redaction():
+        result = load_donor_pool(csv_path, index, needs, db, min_ballots, redact_on_precinct)
+        redacted_row_indices: Set[int] = result[0]
+        aggregate_row: Optional[List[str]] = result[1]
 
-    Pass 2 (implemented here): loads rare rows and donor pool, builds aggregate.
-    Pass 3 (not yet implemented): streams output with redacted rows and aggregate row.
-    """
-    if not needs.needs_redaction():
-        print("No redaction needed.")
-        print("\n(Pass 3 not yet implemented: output not written.)")
-        return
+        rare_count = 0
+        for key, row_indices in index.rows_by_privacy_unit.items():
+            if key in needs.rare_privacy_unit_pairs:
+                rare_count += len(row_indices)
+        borrowed_count = len(redacted_row_indices) - rare_count
 
-    redacted_row_indices, aggregate_row = load_donor_pool(
-        csv_path, index, needs, db, min_ballots, redact_on_precinct
+        print("\n*** Pass 2 complete.")
+        print(f"  Ballots from rare styles/precincts: {rare_count}")
+        if borrowed_count > 0:
+            print(f"  Ballots borrowed from common styles: {borrowed_count}")
+        print(f"  Total ballots in aggregate: {len(redacted_row_indices)}")
+    else:
+        redacted_row_indices = set()
+        aggregate_row = None
+
+    print("\n*** Pass 3: Writing output.")
+    _stream_redacted_output(
+        csv_path, db, output_file, redacted_row_indices, aggregate_row, redact_on_precinct
     )
-
-    rare_count = 0
-    for key, row_indices in index.rows_by_privacy_unit.items():
-        if key in needs.rare_privacy_unit_pairs:
-            rare_count += len(row_indices)
-    borrowed_count = len(redacted_row_indices) - rare_count
-
-    print("\n*** Pass 2 complete.")
-    print(f"  Ballots from rare styles/precincts: {rare_count}")
-    if borrowed_count > 0:
-        print(f"  Ballots borrowed from common styles: {borrowed_count}")
-    print(f"  Total ballots in aggregate: {len(redacted_row_indices)}")
-
-    print("\n(Pass 3 not yet implemented: output not written.)")
+    print(f"  Output written to {output_file}.")
 
 
 # ---------------------------------------------------------------------------
