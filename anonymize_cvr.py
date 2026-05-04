@@ -971,13 +971,16 @@ def build_aggregate(
 
 def _find_near_unanimous_contests(
     aggregate: Aggregate,
+    db: CvrDatabase,
 ) -> List[Tuple[str, Optional[str], int, int]]:
     """
     Return (contest_name, max_choice, max_votes, total_votes) for every rare contest
     in the aggregate that is near-unanimous.
 
-    Contests with only one choice are excluded: they are always unanimous by
-    definition and there is nothing that can be done about it.
+    Contests with only one available choice are excluded: they are always unanimous
+    by definition and nothing can be done about it.  The check uses the number of
+    choice columns in the CVR, not the number of choices that received votes, so a
+    two-choice contest where all ballots voted for the same candidate is NOT excluded.
     """
     result = []
     for contest_name, choice_votes in aggregate.choice_counts().items():
@@ -985,7 +988,7 @@ def _find_near_unanimous_contests(
             continue
         if not choice_votes:
             continue
-        if len(choice_votes) <= 1:
+        if len(db.contest_to_columns.get(contest_name, [])) <= 1:
             continue
         total_votes = sum(choice_votes.values())
         if total_votes == 0:
@@ -1013,7 +1016,7 @@ def balance_unanimity(
     Only checks contests that appeared on rare ballots; near-unanimity in
     contests that belong only to common styles is not a concern here.
     """
-    problematic = _find_near_unanimous_contests(aggregate)
+    problematic = _find_near_unanimous_contests(aggregate, db)
 
     if not problematic:
         print("  There are no near-unanimous contests.")
@@ -1308,7 +1311,7 @@ def load_donor_pool(
     while True:
         count_before = aggregate.total_count()
         balance_unanimity(aggregate, pool, db)
-        still_problematic = _find_near_unanimous_contests(aggregate)
+        still_problematic = _find_near_unanimous_contests(aggregate, db)
         if not still_problematic:
             break
         if aggregate.total_count() == count_before:
