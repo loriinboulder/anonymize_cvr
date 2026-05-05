@@ -974,7 +974,7 @@ def build_aggregate(
         if result is None:
             for contest, needed in aggregate.contests_needing_ballots().items():
                 print(
-                    f"Warning: could not find enough ballots for contest "
+                    f"WARNING: could not find enough ballots for contest "
                     f"'{contest}' (still need {needed} more). "
                     f"This contest may only appear on rare ballot styles.",
                     file=sys.stderr,
@@ -984,10 +984,6 @@ def build_aggregate(
         borrowed_count += 1
         aggregate.add(ballot)
         pool.remove(style_sig, row_idx)
-
-    if borrowed_count:
-        print()
-        print(f"  Borrowed {borrowed_count} ballot(s).")
 
     return aggregate
 
@@ -1209,6 +1205,9 @@ def load_donor_pool(
     # Maps id(row) to row_idx for all loaded rows, used to identify aggregated rows.
     row_to_idx: Dict[int, int] = {}
 
+    print("*** Pass 2: Building the aggregate row.")
+    print()
+
     with open(csv_path, "r", encoding="utf-8") as f:
         reader = csv.reader(f)
         for _ in range(4):
@@ -1316,12 +1315,10 @@ def load_donor_pool(
         dict(donor_by_privacy_unit), min_ballots, rowcount_by_privacy_unit
     )
 
-    print("*** Pass 2: Building aggregate.")
-    print()
-
     aggregate = build_aggregate(rare_rows, rare_ballot_contests, pool, db, min_ballots)
     borrowed_after_ab = aggregate.total_count() - len(rare_rows)
-    print(f"\n  Ballots borrowed for minimum counts: {borrowed_after_ab}")
+    if borrowed_after_ab > 0:
+        print(f"  Ballots borrowed for minimum counts: {borrowed_after_ab}")
 
     print("\n*** Balancing near-unanimous contests.\n")
     print("  Make sure that the following constraint is met:")
@@ -1341,12 +1338,14 @@ def load_donor_pool(
             break  # balance_unanimity could not add any ballots; no point looping
 
     borrowed_after_c = aggregate.total_count() - len(rare_rows)
-    print(f"  Ballots borrowed after unanimity balancing: {borrowed_after_c}")
+    unanimity_borrowed = borrowed_after_c - borrowed_after_ab
+    if unanimity_borrowed > 0:
+        print(f"  Total ballots borrowed for unanimity balancing: {unanimity_borrowed}")
 
     if still_problematic:
         print()
         print(
-            "  Warning: the following contests remain near-unanimous after balancing."
+            "  WARNING: the following contests remain near-unanimous after balancing."
         )
         print("  No contrasting ballots were available in the donor pool.")
         for contest_name, max_choice, max_votes, total_votes in still_problematic:
@@ -1388,6 +1387,7 @@ def _stream_redacted_output(
     redacted_row_indices: Set[int],
     aggregate_row: Optional[List[str]],
     redact_on_precinct: bool,
+    redacted_list_file: Optional[str],
 ) -> None:
     """
     Pass 3: stream input to output, redacting rows in redacted_row_indices,
@@ -1411,30 +1411,41 @@ def _stream_redacted_output(
     pre_tally: List[float] = [0.0] * num_vote_cols
     post_tally: List[float] = [0.0] * num_vote_cols
 
-    with open(csv_path, "r", encoding="utf-8") as f_in:
-        with open(output_file, "w", encoding="utf-8", newline="") as f_out:
-            reader = csv.reader(f_in)
-            writer = csv.writer(f_out, lineterminator=db.lineterminator)
+    list_out = (
+        open(redacted_list_file, "w", encoding="utf-8")
+        if redacted_list_file is not None
+        else None
+    )
+    try:
+        with open(csv_path, "r", encoding="utf-8") as f_in:
+            with open(output_file, "w", encoding="utf-8", newline="") as f_out:
+                reader = csv.reader(f_in)
+                writer = csv.writer(f_out, lineterminator=db.lineterminator)
 
-            for _ in range(4):
-                writer.writerow(_remove_columns(next(reader), cols_to_remove))
+                for _ in range(4):
+                    writer.writerow(_remove_columns(next(reader), cols_to_remove))
 
-            for row_idx, row in enumerate(r for r in reader if r):
-                if row_idx > 0 and row_idx % 100000 == 0:
-                    print(f"  {row_idx:,} rows written...", flush=True)
-                _add_to_tally(pre_tally, row, db.headerlen)
-                if row_idx in redacted_row_indices:
-                    writer.writerow(
-                        _remove_columns(_redact_ballot_row(row, db), cols_to_remove)
-                    )
-                else:
-                    out_row = _blank_geographic_fields(row, db, redact_on_precinct)
-                    writer.writerow(_remove_columns(out_row, cols_to_remove))
-                    _add_to_tally(post_tally, row, db.headerlen)
+                for row_idx, row in enumerate(r for r in reader if r):
+                    if row_idx > 0 and row_idx % 100000 == 0:
+                        print(f"  {row_idx:,} rows written...", flush=True)
+                    _add_to_tally(pre_tally, row, db.headerlen)
+                    if row_idx in redacted_row_indices:
+                        if list_out is not None and len(row) > 4:
+                            list_out.write(row[4] + "\n")
+                        writer.writerow(
+                            _remove_columns(_redact_ballot_row(row, db), cols_to_remove)
+                        )
+                    else:
+                        out_row = _blank_geographic_fields(row, db, redact_on_precinct)
+                        writer.writerow(_remove_columns(out_row, cols_to_remove))
+                        _add_to_tally(post_tally, row, db.headerlen)
 
-            if aggregate_row is not None:
-                writer.writerow(_remove_columns(aggregate_row, cols_to_remove))
-                _add_to_tally(post_tally, aggregate_row, db.headerlen)
+                if aggregate_row is not None:
+                    writer.writerow(_remove_columns(aggregate_row, cols_to_remove))
+                    _add_to_tally(post_tally, aggregate_row, db.headerlen)
+    finally:
+        if list_out is not None:
+            list_out.close()
 
     if aggregate_row is not None:
         mismatches = 0
@@ -1443,7 +1454,7 @@ def _stream_redacted_output(
                 mismatches += 1
         if mismatches:
             print(
-                f"Warning: tally mismatch in {mismatches} vote column(s) — "
+                f"WARNING: tally mismatch in {mismatches} vote column(s) — "
                 f"redacted output may be incorrect.",
                 file=sys.stderr,
             )
@@ -1459,6 +1470,7 @@ def perform_redaction(
     min_ballots: int,
     output_file: str,
     redact_on_precinct: bool,
+    redacted_list_file: Optional[str],
 ) -> None:
     """Orchestrate passes 2 and 3 to produce the anonymized CVR."""
     if needs.needs_redaction():
@@ -1491,8 +1503,11 @@ def perform_redaction(
         redacted_row_indices,
         aggregate_row,
         redact_on_precinct,
+        redacted_list_file,
     )
     print(f"  Output written to {output_file}.")
+    if redacted_list_file is not None:
+        print(f"  Redacted ballot list written to {redacted_list_file}.")
 
 
 # ---------------------------------------------------------------------------
@@ -1559,6 +1574,15 @@ def parse_args() -> argparse.Namespace:
         metavar="N",
         help="Column index (0-based) of the named_style field, if present.",
     )
+    parser.add_argument(
+        "--redacted-list",
+        metavar="FILENAME",
+        default=None,
+        help=(
+            "Write the ImprintedId of every redacted ballot to FILENAME, "
+            "one per line.  Useful for identifying ballot images that also need redaction."
+        ),
+    )
     args = parser.parse_args()
     if args.check and args.output_file is not None:
         parser.error("output_file cannot be specified in --check mode.")
@@ -1588,12 +1612,12 @@ def main() -> None:
 
         if args.redact_on_precinct and db.precinct_portion_idx is None:
             print(
-                "Warning: --redact-on-precinct was requested but the CVR has no "
+                "WARNING: --redact-on-precinct was requested but the CVR has no "
                 "PrecinctPortion column.  The option will have no effect.",
                 file=sys.stderr,
             )
 
-        print("*** Pass 1: Building row index.")
+        print("*** Pass 1: Looking for rare ballot styles.")
         print()
         try:
             index = build_row_index(
@@ -1602,13 +1626,6 @@ def main() -> None:
         except (ValueError, OSError) as e:
             print(f"Error building row index: {e}", file=sys.stderr)
             sys.exit(1)
-
-        if args.redact_on_precinct:
-            print(
-                "*** Looking for rare ballot styles and rare precinct/style combinations."
-            )
-        else:
-            print("*** Looking for rare ballot styles.")
         print()
 
         needs = check_redaction_needs(
@@ -1693,6 +1710,7 @@ def main() -> None:
             args.min_ballots,
             args.output_file,
             args.redact_on_precinct,
+            args.redacted_list,
         )
 
 
