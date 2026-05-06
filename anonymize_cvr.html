@@ -1,0 +1,1001 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CVR Anonymizer</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js"></script>
+    <style>
+        body {
+            font-family: sans-serif;
+            max-width: 860px;
+            margin: 2rem auto;
+            padding: 0 1rem;
+            color: #222;
+        }
+        h1 { margin-bottom: 0.2rem; }
+        .subtitle { color: #555; margin: 0 0 1.5rem; font-size: 0.95rem; }
+        .options { margin-bottom: 1rem; }
+        .options label { display: block; margin-bottom: 0.5rem; }
+        .options input[type="number"] { width: 4.5rem; }
+        .file-row { margin-bottom: 1rem; }
+        #runBtn {
+            padding: 0.45rem 1.4rem;
+            font-size: 1rem;
+            cursor: pointer;
+        }
+        #runBtn:disabled { opacity: 0.4; cursor: default; }
+        #status {
+            margin-top: 1rem;
+            background: #f5f5f5;
+            border: 1px solid #ccc;
+            padding: 0.7rem 0.9rem;
+            font-family: monospace;
+            font-size: 0.82rem;
+            max-height: 420px;
+            overflow-y: auto;
+            white-space: pre-wrap;
+            display: none;
+        }
+    </style>
+</head>
+<body>
+
+<h1>CVR Anonymizer</h1>
+<p class="subtitle">Anonymizes Cast Vote Records per Colorado C.R.S. 24-72-205.5.
+Runs entirely in your browser — no file is uploaded to any server.</p>
+
+<div class="options">
+    <label>
+        <input type="checkbox" id="redactOnPrecinct">
+        Redact on precinct &mdash; treat rare (style, precinct) combinations as rare styles
+    </label>
+    <label>
+        Minimum ballots per style:
+        <input type="number" id="minBallots" value="10" min="1">
+    </label>
+</div>
+
+<div class="file-row">
+    <input type="file" id="fileInput" accept=".csv">
+</div>
+
+<button id="runBtn" disabled>Anonymize CVR...</button>
+
+<pre id="status"></pre>
+
+<script>
+// ============================================================
+// Constants (mirror anonymize_cvr.py)
+// ============================================================
+const MIN_BALLOTS_DEFAULT = 10;
+const NEAR_UNANIMOUS_THRESHOLD = 2;
+const MIN_CONTRASTING_VOTES = 3;
+const COVERAGE_WEIGHT = 10.0;
+const DONOR_SURPLUS_THRESHOLD = 3;
+
+// ============================================================
+// CSV helpers
+// ============================================================
+
+function isEmptyRow(row) {
+    return row.length <= 1 && (row[0] || '').trim() === '';
+}
+
+// Serialize one row to a CSV line (no trailing newline).
+function serializeRow(row) {
+    return row.map(cell => {
+        const s = (cell === null || cell === undefined) ? '' : String(cell);
+        if (s.includes(',') || s.includes('"') || s.includes('\n') || s.includes('\r')) {
+            return '"' + s.replace(/"/g, '""') + '"';
+        }
+        return s;
+    }).join(',');
+}
+
+// Parse one CSV line into an array of field strings.
+// Handles quoted fields (including escaped quotes "").
+function parseCsvRow(line) {
+    const result = [];
+    let current = '';
+    let inQuote = false;
+
+    for (let i = 0; i < line.length; i++) {
+        const ch = line[i];
+        if (inQuote) {
+            if (ch === '"') {
+                if (i + 1 < line.length && line[i + 1] === '"') {
+                    current += '"';
+                    i++;
+                } else {
+                    inQuote = false;
+                }
+            } else {
+                current += ch;
+            }
+        } else {
+            if (ch === '"') {
+                inQuote = true;
+            } else if (ch === ',') {
+                result.push(current);
+                current = '';
+            } else {
+                current += ch;
+            }
+        }
+    }
+    result.push(current);
+    return result;
+}
+
+// Return a new row with the columns in colsToRemoveSet omitted.
+function removeColumns(row, colsToRemoveSet) {
+    return row.filter((_, i) => !colsToRemoveSet.has(i));
+}
+
+// ============================================================
+// buildDatabase — parse the four CVR header rows
+// ============================================================
+function buildDatabase(headerRows) {
+    const [versionRow, contestsRow, choicesRow, headersRow] = headerRows;
+
+    let headerlen = 0;
+    for (const cell of contestsRow) {
+        if (cell.trim() === '') { headerlen++; } else { break; }
+    }
+    if (headerlen === 0) {
+        throw new Error(
+            'Could not auto-detect headerlen: no empty cells at the start of the contests row.'
+        );
+    }
+
+    let ballotTypeIdx = null, precinctPortionIdx = null, countingGroupIdx = null;
+    for (let idx = 0; idx < headersRow.length; idx++) {
+        const lower = headersRow[idx].trim().toLowerCase();
+        if      (lower === 'ballottype')      ballotTypeIdx      = idx;
+        else if (lower === 'precinctportion') precinctPortionIdx = idx;
+        else if (lower === 'countinggroup')   countingGroupIdx   = idx;
+    }
+
+    const contestNames    = [];
+    const contestToColumns  = {};
+    const contestChoiceMeta = {};
+
+    for (let colIdx = headerlen; colIdx < contestsRow.length; colIdx++) {
+        const name = contestsRow[colIdx].trim();
+        if (!name) throw new Error(`Contest row column ${colIdx} is empty; expected a contest name.`);
+        if (!(name in contestToColumns)) {
+            contestNames.push(name);
+            contestToColumns[name]  = [];
+            contestChoiceMeta[name] = {};
+        }
+        contestToColumns[name].push(colIdx);
+        const choiceName = colIdx < choicesRow.length ? choicesRow[colIdx].trim() : '';
+        contestChoiceMeta[name][colIdx] = choiceName || ('Choice' + colIdx);
+    }
+
+    return {
+        headerlen,
+        numVoteCols: contestsRow.length - headerlen,
+        ballotTypeIdx,
+        precinctPortionIdx,
+        countingGroupIdx,
+        contestNames,
+        contestToColumns,
+        contestChoiceMeta,
+    };
+}
+
+// ============================================================
+// computeStyle — binary string of '1'/'0' per contest
+// ============================================================
+function computeStyle(row, db) {
+    let style = '';
+    for (const contestName of db.contestNames) {
+        let present = false;
+        for (const colIdx of db.contestToColumns[contestName]) {
+            if ((row[colIdx] || '').trim() !== '') { present = true; break; }
+        }
+        style += present ? '1' : '0';
+    }
+    return style;
+}
+
+function shouldSkipRow(row, db) {
+    for (let colIdx = db.headerlen; colIdx < row.length; colIdx++) {
+        if ((row[colIdx] || '').trim() === '*') return true;
+    }
+    if (db.ballotTypeIdx !== null &&
+        (row[db.ballotTypeIdx] || '').trim() === 'AGGREGATED') return true;
+    if ((row[0] || '').trim() === 'AGGREGATED') return true;
+    return false;
+}
+
+function makeIndex(styleIdForRow, styleStrings, rowsByPrivacyUnit, rowsByBallotType) {
+    return {
+        styleIdForRow, styleStrings, rowsByPrivacyUnit, rowsByBallotType,
+        styleForRow(rowIdx) {
+            const id = styleIdForRow[rowIdx];
+            return id === null ? null : styleStrings[id];
+        },
+        parsePuKey(key) {
+            const pipe = key.indexOf('|');
+            return { style: key.substring(0, pipe), precinct: key.substring(pipe + 1) };
+        },
+    };
+}
+
+// ============================================================
+// Pass 1: stream the file to build db + index.
+// Only stores integers (row indices), not row data.
+// Returns: { db, headerRows, index }
+// ============================================================
+function pass1BuildDbAndIndex(file, redactOnPrecinct) {
+    return new Promise((resolve, reject) => {
+        const headerRows = [];
+        let db = null;
+
+        const styleIdForRow     = [];
+        const styleStrings      = [];
+        const styleTable        = {};
+        const rowsByPrivacyUnit = new Map();
+        const rowsByBallotType  = new Map();
+
+        let fileRowCount = 0;
+        let ballotRowIdx = 0;
+
+        Papa.parse(file, {
+            skipEmptyLines: false,
+            step: function(result) {
+                const row = result.data;
+                fileRowCount++;
+
+                if (fileRowCount <= 4) {
+                    headerRows.push(row);
+                    if (fileRowCount === 4) db = buildDatabase(headerRows);
+                    return;
+                }
+                if (isEmptyRow(row)) return;
+
+                const currentIdx = ballotRowIdx++;
+
+                if (shouldSkipRow(row, db)) {
+                    styleIdForRow.push(null);
+                    return;
+                }
+
+                const styleStr = computeStyle(row, db);
+                if (!(styleStr in styleTable)) {
+                    styleTable[styleStr] = styleStrings.length;
+                    styleStrings.push(styleStr);
+                }
+                styleIdForRow.push(styleTable[styleStr]);
+
+                const precinct = (redactOnPrecinct && db.precinctPortionIdx !== null)
+                    ? (row[db.precinctPortionIdx] || '').trim() : '';
+                const puKey = styleStr + '|' + precinct;
+                if (!rowsByPrivacyUnit.has(puKey)) rowsByPrivacyUnit.set(puKey, []);
+                rowsByPrivacyUnit.get(puKey).push(currentIdx);
+
+                if (db.ballotTypeIdx !== null) {
+                    const bt = (row[db.ballotTypeIdx] || '').trim();
+                    if (bt) {
+                        if (!rowsByBallotType.has(bt)) rowsByBallotType.set(bt, []);
+                        rowsByBallotType.get(bt).push(currentIdx);
+                    }
+                }
+            },
+            complete: function() {
+                resolve({ db, headerRows,
+                          index: makeIndex(styleIdForRow, styleStrings,
+                                           rowsByPrivacyUnit, rowsByBallotType) });
+            },
+            error: reject,
+        });
+    });
+}
+
+// ============================================================
+// checkRedactionNeeds
+// ============================================================
+function checkRedactionNeeds(index, db, minBallots) {
+    const rarePairs        = new Map();
+    const leakageWarnings  = [];
+
+    for (const [puKey, rowIndices] of index.rowsByPrivacyUnit) {
+        if (rowIndices.length < minBallots) rarePairs.set(puKey, rowIndices.length);
+    }
+
+    if (db.ballotTypeIdx !== null) {
+        const btByStyle = {};
+        for (const [bt, rowIndices] of index.rowsByBallotType) {
+            for (const rowIdx of rowIndices) {
+                const style = index.styleForRow(rowIdx);
+                if (style === null) continue;
+                if (!btByStyle[style]) btByStyle[style] = new Set();
+                btByStyle[style].add(bt);
+            }
+        }
+        for (const [style, types] of Object.entries(btByStyle)) {
+            if (types.size > 1) {
+                leakageWarnings.push(
+                    'Leakage: ballot types [' + Array.from(types).sort().join(', ') +
+                    '] all share the same contest pattern'
+                );
+            }
+        }
+    }
+
+    return { rarePairs, leakageWarnings, needsRedaction: () => rarePairs.size > 0 };
+}
+
+// ============================================================
+// Aggregate — tracks the anonymized pool (Rules a, b, c)
+// ============================================================
+class Aggregate {
+    constructor(initialBallots, rareContests, db, minBallots) {
+        this.db = db;
+        this.minBallots = minBallots;
+        this.rareContests = rareContests;
+        this.ballots = [];
+        this.rowIdxSet = new Set();
+        this.contestBallotCounts = {};
+        this.contestChoiceCounts = {};
+
+        for (const name of db.contestNames) {
+            this.contestBallotCounts[name] = 0;
+            this.contestChoiceCounts[name] = {};
+        }
+        for (const item of initialBallots) this.add(item.rowIdx, item.row);
+    }
+
+    add(rowIdx, row) {
+        this.ballots.push({ rowIdx, row });
+        this.rowIdxSet.add(rowIdx);
+
+        for (const [contestName, colIndices] of Object.entries(this.db.contestToColumns)) {
+            if (colIndices.some(ci => (row[ci] || '').trim() !== ''))
+                this.contestBallotCounts[contestName]++;
+        }
+
+        for (const [contestName, colMap] of Object.entries(this.db.contestChoiceMeta)) {
+            for (const [colIdxStr, choiceName] of Object.entries(colMap)) {
+                const val = (row[parseInt(colIdxStr)] || '').trim();
+                if (!val || val === '0') continue;
+                const inc = isNaN(parseFloat(val)) ? 1 : parseFloat(val);
+                const c = this.contestChoiceCounts[contestName];
+                c[choiceName] = (c[choiceName] || 0) + inc;
+            }
+        }
+    }
+
+    containsRow(rowIdx)     { return this.rowIdxSet.has(rowIdx); }
+    totalCount()            { return this.ballots.length; }
+    needsMoreTotalBallots() { return this.ballots.length < this.minBallots; }
+    choiceCounts()          { return this.contestChoiceCounts; }
+
+    contestsNeedingBallots() {
+        const result = {};
+        for (const contest of this.rareContests) {
+            const count = this.contestBallotCounts[contest] || 0;
+            if (count < this.minBallots) result[contest] = this.minBallots - count;
+        }
+        return result;
+    }
+
+    satisfiesMinimums() {
+        return !this.needsMoreTotalBallots() &&
+               Object.keys(this.contestsNeedingBallots()).length === 0;
+    }
+}
+
+// ============================================================
+// CommonPool — donor ballots available for borrowing (Rule d)
+// ============================================================
+class CommonPool {
+    constructor(donors, minBallots, rowcountByPu) {
+        this.donors        = new Map(donors);
+        this.minBallots    = minBallots;
+        this.rowcountByPu  = rowcountByPu;
+        this.removedCounts = new Map();
+    }
+
+    surplus(key) {
+        return (this.rowcountByPu.get(key) || 0) -
+               (this.removedCounts.get(key) || 0) -
+               this.minBallots;
+    }
+
+    canDonate(key) { return this.surplus(key) > 0; }
+    isEmpty()      { return this.donors.size === 0; }
+
+    remove(key, idx) {
+        const rows = this.donors.get(key);
+        rows.splice(idx, 1);
+        this.removedCounts.set(key, (this.removedCounts.get(key) || 0) + 1);
+        if (rows.length === 0 || this.surplus(key) <= 0) this.donors.delete(key);
+    }
+
+    removeRows(rowsToRemove) {
+        const idxSet = new Set(rowsToRemove.map(r => r.rowIdx));
+        for (const [key, rows] of this.donors) {
+            const remaining   = rows.filter(r => !idxSet.has(r.rowIdx));
+            const removedHere = rows.length - remaining.length;
+            if (removedHere > 0)
+                this.removedCounts.set(key, (this.removedCounts.get(key) || 0) + removedHere);
+            if (remaining.length === 0 || this.surplus(key) <= 0) this.donors.delete(key);
+            else this.donors.set(key, remaining);
+        }
+    }
+
+    bestCandidateFor(aggregate, db) {
+        const needed = aggregate.contestsNeedingBallots();
+        if (Object.keys(needed).length > 0) return this._bestForContests(aggregate, db, needed);
+        if (aggregate.needsMoreTotalBallots())  return this._anyCandidate(aggregate);
+        return null;
+    }
+
+    _bestForContests(aggregate, db, needed) {
+        const neededList = Object.keys(needed).filter(c => needed[c] > 0);
+        let best = null, bestScore = -1;
+
+        for (const [key, rows] of this.donors) {
+            if (!this.canDonate(key)) continue;
+            for (let idx = 0; idx < rows.length; idx++) {
+                const { rowIdx, row } = rows[idx];
+                if (aggregate.containsRow(rowIdx)) continue;
+                const covered = neededList.filter(c => ballotHasContest(row, c, db.contestToColumns));
+                if (covered.length === 0) continue;
+                const gain  = covered.reduce(
+                    (s, c) => s + imbalanceReduction(c, row, aggregate.choiceCounts(), db.contestChoiceMeta), 0);
+                const score = COVERAGE_WEIGHT * covered.length + gain;
+                if (score > bestScore) { bestScore = score; best = { key, idx, rowIdx, row }; }
+            }
+        }
+        return best;
+    }
+
+    _anyCandidate(aggregate) {
+        let bestKey = null, bestSurplus = 0;
+        for (const key of this.donors.keys()) {
+            const s = this.surplus(key);
+            if (s > 0 && s > bestSurplus) { bestKey = key; bestSurplus = s; }
+        }
+        if (bestKey === null) return null;
+        for (let idx = 0; idx < this.donors.get(bestKey).length; idx++) {
+            const { rowIdx, row } = this.donors.get(bestKey)[idx];
+            if (!aggregate.containsRow(rowIdx)) return { key: bestKey, idx, rowIdx, row };
+        }
+        return null;
+    }
+}
+
+// ============================================================
+// Redaction helpers
+// ============================================================
+function ballotHasContest(row, contest, contestToColumns) {
+    return (contestToColumns[contest] || []).some(ci => (row[ci] || '').trim() !== '');
+}
+
+function imbalanceReduction(contest, row, choiceCounts, contestChoiceMeta) {
+    const current  = choiceCounts[contest] || {};
+    const curVals  = Object.values(current);
+    const curTotal = curVals.reduce((a, b) => a + b, 0);
+    const curMax   = curVals.length > 0 ? Math.max(...curVals) : 0;
+    const curGap   = curMax - (curTotal - curMax);
+
+    const contributions = {};
+    for (const [colIdxStr, choiceName] of Object.entries(contestChoiceMeta[contest] || {})) {
+        const val = (row[parseInt(colIdxStr)] || '').trim();
+        if (!val || val === '0') continue;
+        contributions[choiceName] = 1;
+    }
+    if (Object.keys(contributions).length === 0) return 0;
+
+    const newCounts = { ...current };
+    let addedTotal = 0;
+    for (const [choice, inc] of Object.entries(contributions)) {
+        newCounts[choice] = (newCounts[choice] || 0) + inc;
+        addedTotal += inc;
+    }
+    const newMax = Math.max(...Object.values(newCounts));
+    return Math.max(0, curGap - (newMax - ((curTotal + addedTotal) - newMax)));
+}
+
+function buildAggregateRow(ballots, db, aggregateId) {
+    if (ballots.length === 0) return [];
+    const result = [...ballots[0].slice(0, db.headerlen)];
+    result[0] = aggregateId;
+    if (result.length > 1) result[1] = '';
+    if (result.length > 2) result[2] = '';
+    if (result.length > 3) result[3] = '';
+    if (result.length > 4) result[4] = '';
+    if (db.countingGroupIdx   !== null) result[db.countingGroupIdx]   = '';
+    if (db.precinctPortionIdx !== null) result[db.precinctPortionIdx] = '';
+    if (db.ballotTypeIdx      !== null) result[db.ballotTypeIdx]      = 'AGGREGATED';
+
+    for (let colIdx = db.headerlen; colIdx < ballots[0].length; colIdx++) {
+        let total = 0;
+        for (const b of ballots) {
+            const p = parseFloat((b[colIdx] || '').trim());
+            if (!isNaN(p)) total += p;
+        }
+        result.push(total === Math.floor(total) ? String(Math.floor(total)) : String(total));
+    }
+    return result;
+}
+
+function redactBallotRow(row, db, redactOnPrecinct) {
+    const r = [...row];
+    if (db.countingGroupIdx !== null) r[db.countingGroupIdx] = '';
+    if (!redactOnPrecinct && db.precinctPortionIdx !== null) r[db.precinctPortionIdx] = '';
+    for (let i = db.headerlen; i < r.length; i++) r[i] = '*';
+    return r;
+}
+
+function blankGeographicFields(row, db, redactOnPrecinct) {
+    const r = [...row];
+    if (db.countingGroupIdx !== null) r[db.countingGroupIdx] = '';
+    if (!redactOnPrecinct && db.precinctPortionIdx !== null) r[db.precinctPortionIdx] = '';
+    return r;
+}
+
+function addToTally(tally, row, headerlen) {
+    for (let i = 0; i < tally.length; i++) {
+        const colIdx = headerlen + i;
+        if (colIdx >= row.length) continue;
+        const p = parseFloat((row[colIdx] || '').trim());
+        if (!isNaN(p)) tally[i] += p;
+    }
+}
+
+// ============================================================
+// buildAggregate — Rules a and b
+// ============================================================
+function buildAggregate(rareBallots, rareContests, pool, db, minBallots, log) {
+    const aggregate = new Aggregate(rareBallots, rareContests, db, minBallots);
+
+    if (!aggregate.satisfiesMinimums()) {
+        log('  Rare ballots: ' + aggregate.totalCount() + '.');
+        log('  Borrowing from common styles to satisfy minimums...');
+    }
+
+    while (!aggregate.satisfiesMinimums()) {
+        const result = pool.bestCandidateFor(aggregate, db);
+        if (result === null) {
+            for (const [contest, n] of Object.entries(aggregate.contestsNeedingBallots()))
+                log("WARNING: could not find enough ballots for contest '" + contest +
+                    "' (still need " + n + " more).");
+            break;
+        }
+        aggregate.add(result.rowIdx, result.row);
+        pool.remove(result.key, result.idx);
+    }
+    return aggregate;
+}
+
+// ============================================================
+// Near-unanimity — Rule c
+// ============================================================
+function findNearUnanimousContests(aggregate, db) {
+    const result = [];
+    for (const [contestName, choiceVotes] of Object.entries(aggregate.choiceCounts())) {
+        if (!aggregate.rareContests.has(contestName)) continue;
+        if (Object.keys(choiceVotes).length === 0) continue;
+        if ((db.contestToColumns[contestName] || []).length <= 1) continue;
+        const totalVotes = Object.values(choiceVotes).reduce((a, b) => a + b, 0);
+        if (totalVotes === 0) continue;
+        let maxChoice = null, maxVotes = 0;
+        for (const [choice, votes] of Object.entries(choiceVotes))
+            if (votes > maxVotes) { maxVotes = votes; maxChoice = choice; }
+        if ((totalVotes - maxVotes) <= NEAR_UNANIMOUS_THRESHOLD)
+            result.push({ contestName, maxChoice, maxVotes, totalVotes });
+    }
+    return result;
+}
+
+function findContrastingBallots(problematic, pool, db) {
+    if (problematic.length === 0) return [];
+    const contestInfo = {};
+    for (const { contestName, maxChoice } of problematic) {
+        const colMap = db.contestChoiceMeta[contestName] || {};
+        let winningCol = null;
+        for (const [s, name] of Object.entries(colMap))
+            if (name === maxChoice) { winningCol = parseInt(s); break; }
+        contestInfo[contestName] = { colIndices: db.contestToColumns[contestName] || [], winningCol };
+    }
+
+    const ballotScores = [];
+    for (const [key, rows] of pool.donors) {
+        if (!pool.canDonate(key)) continue;
+        for (const { rowIdx, row } of rows) {
+            const satisfied = [];
+            for (const { contestName } of problematic) {
+                const { colIndices, winningCol } = contestInfo[contestName];
+                if (!colIndices.some(ci => (row[ci] || '').trim() !== '')) continue;
+                if (winningCol !== null && (row[winningCol] || '').trim() !== '1') {
+                    for (const ci of colIndices)
+                        if (ci !== winningCol && (row[ci] || '').trim() === '1') {
+                            satisfied.push(contestName); break;
+                        }
+                }
+            }
+            if (satisfied.length > 0) ballotScores.push({ score: satisfied.length, satisfied, rowIdx, row });
+        }
+    }
+    ballotScores.sort((a, b) => b.score - a.score);
+
+    const contestsNeeded = new Set(problematic.map(p => p.contestName));
+    const selected = [], contrastCounts = {};
+    for (const { satisfied, rowIdx, row } of ballotScores) {
+        if (!satisfied.some(c => contestsNeeded.has(c))) continue;
+        selected.push({ rowIdx, row });
+        for (const c of satisfied) contrastCounts[c] = (contrastCounts[c] || 0) + 1;
+        for (const c of [...contestsNeeded])
+            if ((contrastCounts[c] || 0) >= MIN_CONTRASTING_VOTES) contestsNeeded.delete(c);
+        if (contestsNeeded.size === 0) break;
+    }
+    return selected;
+}
+
+function balanceUnanimity(aggregate, pool, db, log) {
+    const problematic = findNearUnanimousContests(aggregate, db);
+    if (problematic.length === 0) { log('  There are no near-unanimous contests.'); return; }
+    for (const { contestName, maxChoice, maxVotes, totalVotes } of problematic)
+        log("    '" + contestName + "': '" + maxChoice + "' has " + maxVotes + " out of " + totalVotes + " votes");
+    const contrasting = findContrastingBallots(problematic, pool, db);
+    if (contrasting.length > 0) {
+        pool.removeRows(contrasting);
+        for (const { rowIdx, row } of contrasting) aggregate.add(rowIdx, row);
+        log('\n  Borrowed ' + contrasting.length + ' contrasting ballot(s).');
+    }
+}
+
+// ============================================================
+// Pass 2: stream the file to load rare rows + donors,
+// then build the aggregate in memory.
+// Returns: { redactedRowIndices, aggregateRow }
+// ============================================================
+function pass2LoadAndBuild(file, db, index, needs, minBallots, redactOnPrecinct, log) {
+    const perContestPoolTarget = 10 * minBallots;
+
+    const contestTotalCounts = {};
+    for (const [puKey, rowIndices] of index.rowsByPrivacyUnit) {
+        const { style } = index.parsePuKey(puKey);
+        const count = rowIndices.length;
+        for (let i = 0; i < db.contestNames.length; i++)
+            if (style[i] === '1') {
+                const cn = db.contestNames[i];
+                contestTotalCounts[cn] = (contestTotalCounts[cn] || 0) + count;
+            }
+    }
+
+    const rareBallotContests = new Set();
+    for (const puKey of needs.rarePairs.keys()) {
+        const { style } = index.parsePuKey(puKey);
+        for (let i = 0; i < db.contestNames.length; i++)
+            if (style[i] === '1') rareBallotContests.add(db.contestNames[i]);
+    }
+
+    const rareContests = new Set();
+    for (const cn of rareBallotContests)
+        if ((contestTotalCounts[cn] || 0) < perContestPoolTarget) rareContests.add(cn);
+
+    const rowcountByPu = new Map();
+    for (const [puKey, rowIndices] of index.rowsByPrivacyUnit)
+        rowcountByPu.set(puKey, rowIndices.length);
+
+    return new Promise((resolve, reject) => {
+        const donorCountByContest = {}, donorVotedTally = {};
+        const rareRows = [], donorByPu = new Map();
+        let fileRowCount = 0, ballotRowIdx = 0;
+
+        Papa.parse(file, {
+            skipEmptyLines: false,
+            step: function(result) {
+                const row = result.data;
+                fileRowCount++;
+                if (fileRowCount <= 4) return;
+                if (isEmptyRow(row)) return;
+
+                const currentIdx = ballotRowIdx++;
+                const rowStyle = index.styleForRow(currentIdx);
+                if (rowStyle === null) return;
+
+                const precinct = (redactOnPrecinct && db.precinctPortionIdx !== null)
+                    ? (row[db.precinctPortionIdx] || '').trim() : '';
+                const puKey = rowStyle + '|' + precinct;
+
+                if (needs.rarePairs.has(puKey)) {
+                    rareRows.push({ rowIdx: currentIdx, row }); return;
+                }
+
+                const puCount = rowcountByPu.get(puKey) || 0;
+                if (puCount <= minBallots) return;
+
+                const rowRareContests = [];
+                for (const cn of rareBallotContests)
+                    if (ballotHasContest(row, cn, db.contestToColumns)) rowRareContests.push(cn);
+                if (rowRareContests.length === 0) return;
+
+                if (puCount <= minBallots + DONOR_SURPLUS_THRESHOLD) {
+                    if (!rowRareContests.some(cn => rareContests.has(cn))) return;
+                } else {
+                    const poolNeedsMore = rowRareContests.some(
+                        cn => (donorCountByContest[cn] || 0) < perContestPoolTarget);
+                    if (!poolNeedsMore) {
+                        let needsContrast = false;
+                        for (const cn of rowRareContests) {
+                            const tally = donorVotedTally[cn];
+                            if (!tally || !Object.keys(tally).length) continue;
+                            let maxChoice = null, maxCount = -1;
+                            for (const [c, n] of Object.entries(tally))
+                                if (n > maxCount) { maxCount = n; maxChoice = c; }
+                            let rowVoted = null;
+                            for (const [s, name] of Object.entries(db.contestChoiceMeta[cn] || {}))
+                                if ((row[parseInt(s)] || '').trim() === '1') { rowVoted = name; break; }
+                            if (rowVoted === null || rowVoted === maxChoice) continue;
+                            let cSoFar = 0;
+                            for (const [c, v] of Object.entries(tally))
+                                if (c !== maxChoice) cSoFar += v;
+                            if (cSoFar < MIN_CONTRASTING_VOTES) { needsContrast = true; break; }
+                        }
+                        if (!needsContrast) return;
+                    }
+                }
+
+                if (!donorByPu.has(puKey)) donorByPu.set(puKey, []);
+                donorByPu.get(puKey).push({ rowIdx: currentIdx, row });
+                for (const cn of rowRareContests) {
+                    donorCountByContest[cn] = (donorCountByContest[cn] || 0) + 1;
+                    if (!donorVotedTally[cn]) donorVotedTally[cn] = {};
+                    const tally = donorVotedTally[cn];
+                    for (const [s, name] of Object.entries(db.contestChoiceMeta[cn] || {}))
+                        if ((row[parseInt(s)] || '').trim() === '1') {
+                            tally[name] = (tally[name] || 0) + 1; break;
+                        }
+                }
+            },
+            complete: function() {
+                const pool      = new CommonPool(donorByPu, minBallots, rowcountByPu);
+                const aggregate = buildAggregate(rareRows, rareBallotContests, pool, db, minBallots, log);
+
+                const borrowedAfterAb = aggregate.totalCount() - rareRows.length;
+                if (borrowedAfterAb > 0)
+                    log('  Ballots borrowed for minimum counts: ' + borrowedAfterAb);
+
+                log('\n*** Balancing near-unanimous contests.\n');
+                let stillProblematic = [];
+                while (true) {
+                    const before = aggregate.totalCount();
+                    balanceUnanimity(aggregate, pool, db, log);
+                    stillProblematic = findNearUnanimousContests(aggregate, db);
+                    if (!stillProblematic.length) break;
+                    if (aggregate.totalCount() === before) break;
+                }
+
+                const unanimityBorrowed = aggregate.totalCount() - rareRows.length - borrowedAfterAb;
+                if (unanimityBorrowed > 0)
+                    log('  Total ballots borrowed for unanimity balancing: ' + unanimityBorrowed);
+
+                if (stillProblematic.length > 0) {
+                    log('\n  WARNING: the following contests remain near-unanimous after balancing.');
+                    log('  No contrasting ballots were available in the donor pool.');
+                    for (const { contestName, maxChoice, maxVotes, totalVotes } of stillProblematic)
+                        log("    '" + contestName + "': '" + maxChoice + "' has " +
+                            maxVotes + " out of " + totalVotes + " votes");
+                }
+
+                resolve({
+                    redactedRowIndices: new Set(aggregate.ballots.map(b => b.rowIdx)),
+                    aggregateRow: buildAggregateRow(aggregate.ballots.map(b => b.row), db, 'AGGREGATED'),
+                });
+            },
+            error: reject,
+        });
+    });
+}
+
+// ============================================================
+// Pass 3: stream the file and write output directly to
+// a FileSystemWritableFileStream, one row at a time.
+// No output accumulates in memory.
+// ============================================================
+async function pass3WriteToFile(file, db, headerRows, redactedRowIndices,
+                                aggregateRow, redactOnPrecinct, writable, log) {
+    const colsToRemove = new Set();
+    if (db.countingGroupIdx   !== null) colsToRemove.add(db.countingGroupIdx);
+    if (!redactOnPrecinct && db.precinctPortionIdx !== null)
+        colsToRemove.add(db.precinctPortionIdx);
+
+    const preTally  = new Array(db.numVoteCols).fill(0);
+    const postTally = new Array(db.numVoteCols).fill(0);
+
+    // Buffer rows and flush to disk periodically to avoid one write per row.
+    const FLUSH_ROWS = 500;
+    const buf = [];
+    async function flush() {
+        if (buf.length > 0) { await writable.write(buf.join('')); buf.length = 0; }
+    }
+    function writeLine(row) {
+        buf.push(serializeRow(removeColumns(row, colsToRemove)) + '\n');
+    }
+
+    // Write the four header rows (already in memory from Pass 1).
+    for (const row of headerRows) writeLine(row);
+    await flush();
+
+    // Stream the file for ballot rows.
+    const reader  = file.stream().getReader();
+    const decoder = new TextDecoder();
+    let lineBuffer   = '';
+    let fileLineCount = 0;   // non-empty lines seen (headers + ballot rows)
+    let ballotRowIdx  = 0;   // non-empty ballot rows seen
+
+    while (true) {
+        const { done, value } = await reader.read();
+        lineBuffer += decoder.decode(value || new Uint8Array(), { stream: !done });
+
+        let newlineIdx;
+        while ((newlineIdx = lineBuffer.indexOf('\n')) !== -1) {
+            const line = lineBuffer.substring(0, newlineIdx).replace(/\r$/, '');
+            lineBuffer  = lineBuffer.substring(newlineIdx + 1);
+
+            if (line.trim() === '') continue;   // skip blank lines, don't count
+            fileLineCount++;
+            if (fileLineCount <= 4) continue;   // header lines already written
+
+            const row        = parseCsvRow(line);
+            const currentIdx = ballotRowIdx++;
+            addToTally(preTally, row, db.headerlen);
+
+            if (redactedRowIndices.has(currentIdx)) {
+                writeLine(redactBallotRow(row, db, redactOnPrecinct));
+            } else {
+                writeLine(blankGeographicFields(row, db, redactOnPrecinct));
+                addToTally(postTally, row, db.headerlen);
+            }
+
+            if (buf.length >= FLUSH_ROWS) await flush();
+        }
+        if (done) break;
+    }
+
+    // Handle any remaining content (last line with no trailing newline).
+    if (lineBuffer.trim() !== '') {
+        const row        = parseCsvRow(lineBuffer);
+        const currentIdx = ballotRowIdx++;
+        addToTally(preTally, row, db.headerlen);
+        writeLine(blankGeographicFields(row, db, redactOnPrecinct));
+        addToTally(postTally, row, db.headerlen);
+    }
+
+    // Append the aggregate row and verify tallies.
+    if (aggregateRow !== null) {
+        writeLine(aggregateRow);
+        addToTally(postTally, aggregateRow, db.headerlen);
+    }
+    await flush();
+    await writable.close();
+
+    if (aggregateRow !== null) {
+        let mismatches = 0;
+        for (let i = 0; i < db.numVoteCols; i++)
+            if (Math.abs(preTally[i] - postTally[i]) > 0.001) mismatches++;
+        if (mismatches > 0)
+            log('WARNING: tally mismatch in ' + mismatches + ' vote column(s).');
+        else
+            log('  Tally verification passed.');
+    }
+}
+
+// ============================================================
+// UI
+// ============================================================
+let selectedFile = null;
+
+document.getElementById('fileInput').addEventListener('change', function(e) {
+    selectedFile = e.target.files[0] || null;
+    document.getElementById('runBtn').disabled = !selectedFile;
+    const statusEl = document.getElementById('status');
+    statusEl.textContent = '';
+    statusEl.style.display = 'none';
+});
+
+document.getElementById('runBtn').addEventListener('click', async function() {
+    if (!selectedFile) return;
+
+    if (!window.showSaveFilePicker) {
+        alert('This browser does not support the File System Access API.\n' +
+              'Please use Chrome or Edge.');
+        return;
+    }
+
+    // Open the Save As dialog immediately while we still have the user gesture.
+    // The user picks the output path before processing begins.
+    let fileHandle;
+    try {
+        fileHandle = await window.showSaveFilePicker({
+            suggestedName: selectedFile.name.replace(/\.csv$/i, '_anonymized.csv'),
+            types: [{ description: 'CSV file', accept: { 'text/csv': ['.csv'] } }],
+        });
+    } catch (e) {
+        if (e.name === 'AbortError') return;   // user cancelled — do nothing
+        throw e;
+    }
+
+    const minBallots       = parseInt(document.getElementById('minBallots').value) || MIN_BALLOTS_DEFAULT;
+    const redactOnPrecinct = document.getElementById('redactOnPrecinct').checked;
+
+    const statusEl = document.getElementById('status');
+    statusEl.textContent = '';
+    statusEl.style.display = 'block';
+
+    function log(msg) {
+        statusEl.textContent += msg + '\n';
+        statusEl.scrollTop = statusEl.scrollHeight;
+    }
+
+    this.disabled = true;
+    let writable = null;
+
+    try {
+        writable = await fileHandle.createWritable();
+
+        log('*** Pass 1: Looking for rare ballot styles.\n');
+        const { db, headerRows, index } =
+            await pass1BuildDbAndIndex(selectedFile, redactOnPrecinct);
+        log('  ' + index.styleStrings.length + ' distinct ballot styles found.');
+
+        const needs = checkRedactionNeeds(index, db, minBallots);
+        for (const w of needs.leakageWarnings) log('WARNING: ' + w);
+
+        if (needs.rarePairs.size > 0) {
+            const total = redactOnPrecinct ? index.rowsByPrivacyUnit.size : index.styleStrings.length;
+            const label = redactOnPrecinct ? 'Rare ballot style/precinct combinations'
+                                           : 'Rare ballot styles';
+            log('\n  ' + label + ' (' + needs.rarePairs.size + ' of ' + total + ' total):');
+            for (const [puKey, count] of [...needs.rarePairs.entries()].sort((a, b) => a[1] - b[1])) {
+                const { style } = index.parsePuKey(puKey);
+                log('    ' + count + ' ballot(s)  [style #' + index.styleStrings.indexOf(style) + ']');
+            }
+        }
+
+        log(needs.needsRedaction() ? '\nRedaction is needed.' : '\nNo redaction needed.');
+
+        log('\n*** Pass 2: Building the aggregate row.\n');
+        let redactedRowIndices = new Set(), aggregateRow = null;
+
+        if (needs.needsRedaction()) {
+            ({ redactedRowIndices, aggregateRow } = await pass2LoadAndBuild(
+                selectedFile, db, index, needs, minBallots, redactOnPrecinct, log));
+
+            const rareCount = [...needs.rarePairs.keys()].reduce(
+                (s, k) => s + (index.rowsByPrivacyUnit.get(k) || []).length, 0);
+            const borrowedCount = redactedRowIndices.size - rareCount;
+            log('\n*** Pass 2 complete.');
+            log('  Ballots from rare styles/precincts: ' + rareCount);
+            if (borrowedCount > 0) log('  Ballots borrowed from common styles: ' + borrowedCount);
+            log('  Total ballots in aggregate: ' + redactedRowIndices.size);
+        }
+
+        log('\n*** Pass 3: Writing output.');
+        await pass3WriteToFile(
+            selectedFile, db, headerRows,
+            redactedRowIndices, aggregateRow, redactOnPrecinct, writable, log);
+        writable = null;   // pass3WriteToFile closed it
+
+        log('  Output written to ' + fileHandle.name + '.');
+        log('\nDone.');
+
+    } catch (err) {
+        log('\nError: ' + err.message);
+        console.error(err);
+        if (writable) { try { await writable.abort(); } catch (_) {} }
+    } finally {
+        this.disabled = false;
+    }
+});
+</script>
+</body>
+</html>

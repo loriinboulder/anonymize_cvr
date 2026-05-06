@@ -878,17 +878,20 @@ def _remove_columns(row: List[str], cols_to_remove: List[int]) -> List[str]:
     return result
 
 
-def _redact_ballot_row(ballot: List[str], db: CvrDatabase) -> List[str]:
+def _redact_ballot_row(
+    ballot: List[str], db: CvrDatabase, redact_on_precinct: bool
+) -> List[str]:
     """
     Return a copy of the ballot with all vote columns replaced by '*'.
 
-    CountingGroup and PrecinctPortion are always blanked on redacted rows,
-    regardless of the --redact-on-precinct setting.
+    CountingGroup is always blanked.  PrecinctPortion is blanked only when
+    redact_on_precinct is False; when True it is preserved so that the output
+    matches non-redacted rows (rare precincts have already been aggregated).
     """
     result = ballot.copy()
     if db.counting_group_idx is not None:
         result[db.counting_group_idx] = ""
-    if db.precinct_portion_idx is not None:
+    if not redact_on_precinct and db.precinct_portion_idx is not None:
         result[db.precinct_portion_idx] = ""
     for col_idx in range(db.headerlen, len(result)):
         result[col_idx] = "*"
@@ -1433,7 +1436,10 @@ def _stream_redacted_output(
                         if list_out is not None and len(row) > 4:
                             list_out.write(row[4] + "\n")
                         writer.writerow(
-                            _remove_columns(_redact_ballot_row(row, db), cols_to_remove)
+                            _remove_columns(
+                                _redact_ballot_row(row, db, redact_on_precinct),
+                                cols_to_remove,
+                            )
                         )
                     else:
                         out_row = _blank_geographic_fields(row, db, redact_on_precinct)
