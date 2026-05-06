@@ -230,7 +230,7 @@ function makeIndex(styleIdForRow, styleStrings, rowsByPrivacyUnit, rowsByBallotT
 // Only stores integers (row indices), not row data.
 // Returns: { db, headerRows, index }
 // ============================================================
-function pass1BuildDbAndIndex(file, redactOnPrecinct) {
+function pass1BuildDbAndIndex(file, redactOnPrecinct, log) {
     return new Promise((resolve, reject) => {
         const headerRows = [];
         let db = null;
@@ -258,6 +258,8 @@ function pass1BuildDbAndIndex(file, redactOnPrecinct) {
                 if (isEmptyRow(row)) return;
 
                 const currentIdx = ballotRowIdx++;
+                if (ballotRowIdx % 100000 === 0)
+                    log('  ' + ballotRowIdx.toLocaleString() + ' rows scanned (pass 1)...');
 
                 if (shouldSkipRow(row, db)) {
                     styleIdForRow.push(null);
@@ -699,6 +701,8 @@ function pass2LoadAndBuild(file, db, index, needs, minBallots, redactOnPrecinct,
                 if (isEmptyRow(row)) return;
 
                 const currentIdx = ballotRowIdx++;
+                if (ballotRowIdx % 100000 === 0)
+                    log('  ' + ballotRowIdx.toLocaleString() + ' rows scanned (pass 2)...');
                 const rowStyle = index.styleForRow(currentIdx);
                 if (rowStyle === null) return;
 
@@ -847,6 +851,8 @@ async function pass3WriteToFile(file, db, headerRows, redactedRowIndices,
 
             const row        = parseCsvRow(line);
             const currentIdx = ballotRowIdx++;
+            if (ballotRowIdx % 100000 === 0)
+                log('  ' + ballotRowIdx.toLocaleString() + ' rows written (pass 3)...');
             addToTally(preTally, row, db.headerlen);
 
             if (redactedRowIndices.has(currentIdx)) {
@@ -944,7 +950,7 @@ document.getElementById('runBtn').addEventListener('click', async function() {
 
         log('*** Pass 1: Looking for rare ballot styles.\n');
         const { db, headerRows, index } =
-            await pass1BuildDbAndIndex(selectedFile, redactOnPrecinct);
+            await pass1BuildDbAndIndex(selectedFile, redactOnPrecinct, log);
         log('  ' + index.styleStrings.length + ' distinct ballot styles found.');
 
         const needs = checkRedactionNeeds(index, db, minBallots);
