@@ -23,7 +23,12 @@ Terminology used throughout this module:
 
 import argparse
 import csv
+import io
+import queue as queue_module
 import sys
+import threading
+import tkinter as tk
+from tkinter import filedialog, messagebox
 from collections import defaultdict
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -34,6 +39,33 @@ COVERAGE_WEIGHT = 10.0  # weight for contest coverage vs. vote-balance score
 DONOR_SURPLUS_THRESHOLD = (
     3  # minimum surplus above min_ballots for a style/precinct to donate freely
 )
+
+
+# ---------------------------------------------------------------------------
+# _QueueWriter
+# ---------------------------------------------------------------------------
+
+
+class _QueueWriter:
+    """File-like object that puts lines into a queue for GUI display."""
+
+    def __init__(self, q: "queue_module.Queue[Optional[str]]") -> None:
+        self._q = q
+        self._buf = ""
+
+    def write(self, text: str) -> None:
+        self._buf += text
+        while "\n" in self._buf:
+            line, self._buf = self._buf.split("\n", 1)
+            self._q.put(line)
+
+    def flush(self) -> None:
+        if self._buf:
+            self._q.put(self._buf)
+            self._buf = ""
+
+    def fileno(self) -> int:
+        raise io.UnsupportedOperation("fileno")
 
 
 # ---------------------------------------------------------------------------
@@ -1331,6 +1363,7 @@ def load_donor_pool(
     # Loop until no near-unanimous contests remain or the pool is exhausted.
     # Each pass either adds at least one ballot (shrinking the finite pool) or
     # adds nothing, in which case we are stuck and exit.  Termination is guaranteed.
+    still_problematic: List[Tuple[str, Optional[str], int, int]] = []
     while True:
         count_before = aggregate.total_count()
         balance_unanimity(aggregate, pool, db)
@@ -1517,7 +1550,174 @@ def perform_redaction(
 
 
 # ---------------------------------------------------------------------------
-# Argument parsing
+# High-level execution functions (shared by CLI and GUI)
+# ---------------------------------------------------------------------------
+
+
+def _report_check_results(
+    index: RowIndex,
+    db: CvrDatabase,
+    needs: RedactionNeeds,
+    redact_on_precinct: bool,
+) -> None:
+    """Print the rare-style report and redaction verdict to stdout."""
+    ballot_types_by_style: Dict[str, Set[str]] = defaultdict(set)
+    for ballot_type, row_indices in index.rows_by_ballot_type.items():
+        for row_idx in row_indices:
+            style = index.style_for_row(row_idx)
+            if style is not None:
+                ballot_types_by_style[style].add(ballot_type)
+
+    named_styles_by_style: Dict[str, Set[str]] = defaultdict(set)
+    for named_style, row_indices in index.rows_by_named_style.items():
+        for row_idx in row_indices:
+            style = index.style_for_row(row_idx)
+            if style is not None:
+                named_styles_by_style[style].add(named_style)
+
+    total_styles = len(index.style_strings)
+    show_precinct = redact_on_precinct and db.precinct_portion_idx is not None
+
+    if needs.rare_privacy_unit_pairs:
+        if show_precinct:
+            total_pairs = len(index.rows_by_privacy_unit)
+            print(
+                f"  Rare ballot style/precinct combinations "
+                f"({len(needs.rare_privacy_unit_pairs)} of {total_pairs} total):"
+            )
+        else:
+            print(
+                f"  Rare ballot styles "
+                f"({len(needs.rare_privacy_unit_pairs)} of {total_styles} total):"
+            )
+        style_to_id: Dict[str, int] = {}
+        for i, s in enumerate(index.style_strings):
+            style_to_id[s] = i
+
+        for (style, precinct), count in sorted(
+            needs.rare_privacy_unit_pairs.items(), key=lambda item: item[1]
+        ):
+            ballot_types = ballot_types_by_style.get(style, set())
+            named_styles_for_style = named_styles_by_style.get(style, set())
+
+            parts = []
+            if show_precinct:
+                parts.append(f'precinct "{precinct}"')
+            if ballot_types:
+                parts.append(
+                    "ballot type: " + ", ".join(f'"{t}"' for t in sorted(ballot_types))
+                )
+            elif named_styles_for_style:
+                parts.append(
+                    "named style: "
+                    + ", ".join(f'"{n}"' for n in sorted(named_styles_for_style))
+                )
+            parts.append(f"style #{style_to_id[style]}")
+            print(f"    {count} ballot(s)  [{', '.join(parts)}]")
+
+    if needs.needs_redaction():
+        print("\nRedaction is needed.")
+    else:
+        print("No redaction needed.")
+
+
+def execute_check(
+    input_file: str,
+    min_ballots: int,
+    redact_on_precinct: bool,
+    style_col: Optional[int] = None,
+) -> None:
+    """
+    Run check mode: pass 1 only.  Reports whether the CVR needs redaction.
+    All output goes to stdout/stderr (redirectable for GUI use).
+    """
+    with TempCVRFile(input_file) as csv_path:
+        try:
+            db = CvrDatabase(csv_path, 0, style_col)
+        except (ValueError, OSError) as e:
+            print(f"Error reading CVR file: {e}", file=sys.stderr)
+            return
+
+        if redact_on_precinct and db.precinct_portion_idx is None:
+            print(
+                "WARNING: --redact-on-precinct was requested but the CVR has no "
+                "PrecinctPortion column. The option will have no effect.",
+                file=sys.stderr,
+            )
+
+        print("*** Pass 1: Looking for rare ballot styles.")
+        print()
+        try:
+            index = build_row_index(csv_path, db, redact_on_precinct, check_mode=True)
+        except (ValueError, OSError) as e:
+            print(f"Error building row index: {e}", file=sys.stderr)
+            return
+        print()
+
+        needs = check_redaction_needs(index, db, min_ballots, redact_on_precinct)
+
+        for warning in needs.leakage_warnings:
+            print(f"WARNING: {warning}", file=sys.stderr)
+
+        _report_check_results(index, db, needs, redact_on_precinct)
+
+
+def execute_redact(
+    input_file: str,
+    output_file: str,
+    redacted_list_file: Optional[str],
+    min_ballots: int,
+    redact_on_precinct: bool,
+    style_col: Optional[int] = None,
+) -> None:
+    """
+    Run full redaction: passes 1, 2, and 3.  Writes the anonymized CVR.
+    All output goes to stdout/stderr (redirectable for GUI use).
+    """
+    with TempCVRFile(input_file) as csv_path:
+        try:
+            db = CvrDatabase(csv_path, 0, style_col)
+        except (ValueError, OSError) as e:
+            print(f"Error reading CVR file: {e}", file=sys.stderr)
+            return
+
+        if redact_on_precinct and db.precinct_portion_idx is None:
+            print(
+                "WARNING: --redact-on-precinct was requested but the CVR has no "
+                "PrecinctPortion column. The option will have no effect.",
+                file=sys.stderr,
+            )
+
+        print("*** Pass 1: Looking for rare ballot styles.")
+        print()
+        try:
+            index = build_row_index(csv_path, db, redact_on_precinct, check_mode=False)
+        except (ValueError, OSError) as e:
+            print(f"Error building row index: {e}", file=sys.stderr)
+            return
+        print()
+
+        needs = check_redaction_needs(index, db, min_ballots, redact_on_precinct)
+
+        for warning in needs.leakage_warnings:
+            print(f"WARNING: {warning}", file=sys.stderr)
+
+        _report_check_results(index, db, needs, redact_on_precinct)
+
+        perform_redaction(
+            csv_path,
+            db,
+            index,
+            needs,
+            min_ballots,
+            output_file,
+            redact_on_precinct,
+            redacted_list_file,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Argument parsing (CLI)
 # ---------------------------------------------------------------------------
 
 
@@ -1564,16 +1764,6 @@ def parse_args() -> argparse.Namespace:
         help=f"Minimum ballots required per style or precinct (default: {MIN_BALLOTS_DEFAULT}).",
     )
     parser.add_argument(
-        "--headerlen",
-        type=int,
-        default=0,
-        metavar="N",
-        help=(
-            "Number of header columns before vote data begins. "
-            "Auto-detected from the contests row if not specified."
-        ),
-    )
-    parser.add_argument(
         "--stylecol",
         type=int,
         default=None,
@@ -1598,126 +1788,466 @@ def parse_args() -> argparse.Namespace:
 
 
 # ---------------------------------------------------------------------------
+# CLI entry point
+# ---------------------------------------------------------------------------
+
+
+def cli_main() -> None:
+    args = parse_args()
+    if args.check:
+        execute_check(
+            args.input_file,
+            args.min_ballots,
+            args.redact_on_precinct,
+            args.stylecol,
+        )
+    else:
+        execute_redact(
+            args.input_file,
+            args.output_file,
+            args.redacted_list,
+            args.min_ballots,
+            args.redact_on_precinct,
+            args.stylecol,
+        )
+
+
+# ---------------------------------------------------------------------------
+# GUI
+# ---------------------------------------------------------------------------
+
+
+class CvrAnonymizerApp:
+    def __init__(self, root: tk.Tk) -> None:
+        self.root = root
+        self.root.title("CVR Anonymizer")
+        self.root.geometry("700x540")
+        self.root.resizable(True, True)
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        self.config_redact_on_precinct: bool = False
+        self.config_min_ballots: int = MIN_BALLOTS_DEFAULT
+        self.config_style_col: Optional[int] = None
+
+        self._output_queue: "queue_module.Queue[Optional[str]]" = queue_module.Queue()
+        self._run_button: Optional[tk.Button] = None
+        self._status_text: Optional[tk.Text] = None
+
+        self._show_main_menu()
+
+    def _on_close(self) -> None:
+        if messagebox.askokcancel("Quit", "Are you sure you want to exit?"):
+            self.root.destroy()
+
+    def _clear_screen(self) -> None:
+        for widget in self.root.winfo_children():
+            widget.destroy()
+
+    # ------------------------------------------------------------------
+    # Main menu
+    # ------------------------------------------------------------------
+
+    def _show_main_menu(self) -> None:
+        self._clear_screen()
+
+        tk.Label(
+            self.root, text="CVR Anonymizer", font=("TkDefaultFont", 14, "bold")
+        ).pack(pady=20)
+
+        tk.Label(
+            self.root,
+            text="Anonymize Cast Vote Records per Colorado C.R.S. 24-72-205.5",
+            font=("TkDefaultFont", 9),
+            fg="gray",
+        ).pack(pady=(0, 15))
+
+        btn_frame = tk.Frame(self.root, padx=10, pady=5)
+        btn_frame.pack()
+
+        tk.Button(
+            btn_frame,
+            text="(1) Configure Redaction Options",
+            command=self._show_config_screen,
+            width=42,
+        ).pack(pady=5)
+        tk.Button(
+            btn_frame,
+            text="(2) Produce Redacted CVR",
+            command=self._show_redact_screen,
+            width=42,
+        ).pack(pady=5)
+        tk.Button(
+            btn_frame,
+            text="(3) Check CVR File",
+            command=self._show_check_screen,
+            width=42,
+        ).pack(pady=5)
+        tk.Button(
+            btn_frame,
+            text="Quit",
+            command=self._on_close,
+            width=42,
+        ).pack(pady=(15, 5))
+
+        parts = [f"Min ballots: {self.config_min_ballots}"]
+        if self.config_redact_on_precinct:
+            parts.append("Redact on precinct: yes")
+        if self.config_style_col is not None:
+            parts.append(f"Style column: {self.config_style_col}")
+        tk.Label(
+            self.root,
+            text="  |  ".join(parts),
+            font=("TkDefaultFont", 9),
+            fg="gray",
+        ).pack(pady=(20, 0))
+
+    # ------------------------------------------------------------------
+    # Configure options screen
+    # ------------------------------------------------------------------
+
+    def _show_config_screen(self) -> None:
+        self._clear_screen()
+
+        tk.Label(
+            self.root,
+            text="Configure Redaction Options",
+            font=("TkDefaultFont", 14, "bold"),
+        ).pack(pady=15)
+
+        frame = tk.Frame(self.root, padx=20, pady=5)
+        frame.pack(fill=tk.X)
+
+        self._redact_on_precinct_var = tk.BooleanVar(
+            value=self.config_redact_on_precinct
+        )
+        tk.Checkbutton(
+            frame,
+            text=(
+                "Redact on Precinct\n"
+                "    Treat (ballot style, precinct) combinations with fewer than\n"
+                "    the minimum ballots as rare, in addition to rare styles alone."
+            ),
+            variable=self._redact_on_precinct_var,
+            justify=tk.LEFT,
+            anchor=tk.W,
+        ).pack(anchor=tk.W, pady=(5, 12))
+
+        min_row = tk.Frame(frame)
+        min_row.pack(anchor=tk.W, pady=4)
+        tk.Label(min_row, text="Minimum Ballots:").pack(side=tk.LEFT)
+        self._min_ballots_var = tk.StringVar(value=str(self.config_min_ballots))
+        tk.Entry(min_row, textvariable=self._min_ballots_var, width=8).pack(
+            side=tk.LEFT, padx=(8, 0)
+        )
+        tk.Label(
+            min_row,
+            text="  (minimum ballots required per style or precinct)",
+            fg="gray",
+            font=("TkDefaultFont", 9),
+        ).pack(side=tk.LEFT, padx=(5, 0))
+
+        style_row = tk.Frame(frame)
+        style_row.pack(anchor=tk.W, pady=4)
+        tk.Label(style_row, text="Style Column:").pack(side=tk.LEFT)
+        self._style_col_var = tk.StringVar(
+            value="" if self.config_style_col is None else str(self.config_style_col)
+        )
+        tk.Entry(style_row, textvariable=self._style_col_var, width=8).pack(
+            side=tk.LEFT, padx=(8, 0)
+        )
+        tk.Label(
+            style_row,
+            text="  (optional: 0-based column index of the named style field)",
+            fg="gray",
+            font=("TkDefaultFont", 9),
+        ).pack(side=tk.LEFT, padx=(5, 0))
+
+        btn_frame = tk.Frame(self.root, padx=10, pady=15)
+        btn_frame.pack()
+        tk.Button(btn_frame, text="Save", command=self._save_config, width=14).pack(
+            side=tk.LEFT, padx=8
+        )
+        tk.Button(
+            btn_frame, text="Cancel", command=self._show_main_menu, width=14
+        ).pack(side=tk.LEFT, padx=8)
+
+    def _save_config(self) -> None:
+        try:
+            min_b = int(self._min_ballots_var.get().strip())
+            if min_b < 1:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("Error", "Minimum Ballots must be a positive integer.")
+            return
+
+        style_col_str = self._style_col_var.get().strip()
+        style_col: Optional[int]
+        if style_col_str:
+            try:
+                style_col = int(style_col_str)
+                if style_col < 0:
+                    raise ValueError
+            except ValueError:
+                messagebox.showerror(
+                    "Error",
+                    "Style Column must be a non-negative integer or left blank.",
+                )
+                return
+        else:
+            style_col = None
+
+        self.config_redact_on_precinct = self._redact_on_precinct_var.get()
+        self.config_min_ballots = min_b
+        self.config_style_col = style_col
+        self._show_main_menu()
+
+    # ------------------------------------------------------------------
+    # Produce redacted CVR screen
+    # ------------------------------------------------------------------
+
+    def _show_redact_screen(self) -> None:
+        self._clear_screen()
+
+        tk.Label(
+            self.root, text="Produce Redacted CVR", font=("TkDefaultFont", 14, "bold")
+        ).pack(pady=15)
+
+        file_frame = tk.Frame(self.root, padx=15, pady=5)
+        file_frame.pack(fill=tk.X)
+
+        self._redact_input_var = tk.StringVar()
+        self._redact_output_var = tk.StringVar()
+        self._redact_list_var = tk.StringVar()
+
+        self._add_file_row(
+            file_frame,
+            "Input CVR File:",
+            self._redact_input_var,
+            lambda: self._browse_open(self._redact_input_var, "Select input CVR file"),
+        )
+        self._add_file_row(
+            file_frame,
+            "Output CVR File:",
+            self._redact_output_var,
+            lambda: self._browse_save(
+                self._redact_output_var, "Save redacted CVR as", "*.csv"
+            ),
+        )
+        self._add_file_row(
+            file_frame,
+            "Redacted Ballot List\n(optional):",
+            self._redact_list_var,
+            lambda: self._browse_save(
+                self._redact_list_var, "Save redacted ballot list as", "*.txt"
+            ),
+        )
+
+        self._run_button = tk.Button(
+            self.root, text="Run Redaction", command=self._run_redaction, width=18
+        )
+        self._run_button.pack(pady=8)
+
+        self._status_text = self._add_status_area(self.root, height=10)
+
+        tk.Button(
+            self.root, text="Back to Menu", command=self._show_main_menu, width=18
+        ).pack(pady=5)
+
+    def _run_redaction(self) -> None:
+        input_file = self._redact_input_var.get().strip()
+        output_file = self._redact_output_var.get().strip()
+        redacted_list = self._redact_list_var.get().strip() or None
+
+        if not input_file:
+            messagebox.showerror("Error", "Please select an input CVR file.")
+            return
+        if not output_file:
+            messagebox.showerror("Error", "Please select an output CVR file path.")
+            return
+
+        self._run_in_thread(
+            execute_redact,
+            input_file,
+            output_file,
+            redacted_list,
+            self.config_min_ballots,
+            self.config_redact_on_precinct,
+            self.config_style_col,
+        )
+
+    # ------------------------------------------------------------------
+    # Check CVR screen
+    # ------------------------------------------------------------------
+
+    def _show_check_screen(self) -> None:
+        self._clear_screen()
+
+        tk.Label(
+            self.root, text="Check CVR File", font=("TkDefaultFont", 14, "bold")
+        ).pack(pady=15)
+
+        file_frame = tk.Frame(self.root, padx=15, pady=5)
+        file_frame.pack(fill=tk.X)
+
+        self._check_input_var = tk.StringVar()
+
+        self._add_file_row(
+            file_frame,
+            "CVR File:",
+            self._check_input_var,
+            lambda: self._browse_open(
+                self._check_input_var, "Select CVR file to check"
+            ),
+        )
+
+        self._run_button = tk.Button(
+            self.root, text="Check File", command=self._run_check, width=18
+        )
+        self._run_button.pack(pady=8)
+
+        self._status_text = self._add_status_area(self.root, height=14)
+
+        tk.Button(
+            self.root, text="Back to Menu", command=self._show_main_menu, width=18
+        ).pack(pady=5)
+
+    def _run_check(self) -> None:
+        input_file = self._check_input_var.get().strip()
+
+        if not input_file:
+            messagebox.showerror("Error", "Please select a CVR file.")
+            return
+
+        self._run_in_thread(
+            execute_check,
+            input_file,
+            self.config_min_ballots,
+            self.config_redact_on_precinct,
+            self.config_style_col,
+        )
+
+    # ------------------------------------------------------------------
+    # Shared UI helpers
+    # ------------------------------------------------------------------
+
+    def _add_file_row(
+        self,
+        parent: tk.Frame,
+        label: str,
+        var: tk.StringVar,
+        browse_cmd: object,
+    ) -> None:
+        row = tk.Frame(parent)
+        row.pack(fill=tk.X, pady=3)
+        tk.Label(row, text=label, width=24, anchor=tk.E, justify=tk.RIGHT).pack(
+            side=tk.LEFT
+        )
+        tk.Entry(row, textvariable=var, width=40).pack(
+            side=tk.LEFT, padx=(5, 5), fill=tk.X, expand=True
+        )
+        tk.Button(row, text="Browse...", command=browse_cmd).pack(side=tk.LEFT)  # type: ignore[arg-type]
+
+    def _add_status_area(self, parent: tk.Misc, height: int) -> tk.Text:
+        status_frame = tk.Frame(parent, padx=10, pady=5)
+        status_frame.pack(fill=tk.BOTH, expand=True)
+        tk.Label(status_frame, text="Status:").pack(anchor=tk.W)
+
+        scroll_frame = tk.Frame(status_frame)
+        scroll_frame.pack(fill=tk.BOTH, expand=True)
+        scrollbar = tk.Scrollbar(scroll_frame)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        text = tk.Text(
+            scroll_frame,
+            height=height,
+            state=tk.DISABLED,
+            yscrollcommand=scrollbar.set,
+            wrap=tk.CHAR,
+        )
+        text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, pady=(5, 5))
+        scrollbar.config(command=text.yview)
+        return text
+
+    def _browse_open(self, var: tk.StringVar, title: str) -> None:
+        path = filedialog.askopenfilename(
+            title=title, filetypes=[("CSV files", "*.csv"), ("All files", "*.*")]
+        )
+        if path:
+            var.set(path)
+
+    def _browse_save(self, var: tk.StringVar, title: str, default_ext: str) -> None:
+        path = filedialog.asksaveasfilename(
+            title=title,
+            filetypes=[
+                ("CSV files", "*.csv"),
+                ("Text files", "*.txt"),
+                ("All files", "*.*"),
+            ],
+            defaultextension=default_ext,
+        )
+        if path:
+            var.set(path)
+
+    def _append_status(self, text: str) -> None:
+        assert self._status_text is not None
+        self._status_text.config(state=tk.NORMAL)
+        self._status_text.insert(tk.END, text)
+        self._status_text.see(tk.END)
+        self._status_text.config(state=tk.DISABLED)
+
+    def _poll_output_queue(self) -> None:
+        try:
+            while True:
+                item = self._output_queue.get_nowait()
+                if item is None:
+                    if self._run_button is not None:
+                        self._run_button.config(state=tk.NORMAL)
+                    return
+                self._append_status(item + "\n")
+        except queue_module.Empty:
+            pass
+        self.root.after(50, self._poll_output_queue)
+
+    def _run_in_thread(self, func: object, *args: object) -> None:
+        assert self._run_button is not None
+        assert self._status_text is not None
+        self._run_button.config(state=tk.DISABLED)
+        self._status_text.config(state=tk.NORMAL)
+        self._status_text.delete(1.0, tk.END)
+        self._status_text.config(state=tk.DISABLED)
+        self._output_queue = queue_module.Queue()
+
+        def worker() -> None:
+            old_stdout = sys.stdout
+            old_stderr = sys.stderr
+            writer = _QueueWriter(self._output_queue)
+            sys.stdout = writer  # type: ignore[assignment]
+            sys.stderr = writer  # type: ignore[assignment]
+            try:
+                func(*args)  # type: ignore[operator]
+            except Exception as e:
+                print(f"\nUnexpected error: {e}")
+            finally:
+                writer.flush()
+                sys.stdout = old_stdout
+                sys.stderr = old_stderr
+                self._output_queue.put(None)
+
+        threading.Thread(target=worker, daemon=True).start()
+        self.root.after(50, self._poll_output_queue)
+
+
+# ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
 
 
 def main() -> None:
-    args = parse_args()
-
-    with TempCVRFile(args.input_file) as csv_path:
-        try:
-            db = CvrDatabase(
-                csv_path,
-                args.headerlen,
-                args.stylecol,
-            )
-        except (ValueError, OSError) as e:
-            print(f"Error reading CVR file: {e}", file=sys.stderr)
-            sys.exit(1)
-
-        if args.redact_on_precinct and db.precinct_portion_idx is None:
-            print(
-                "WARNING: --redact-on-precinct was requested but the CVR has no "
-                "PrecinctPortion column.  The option will have no effect.",
-                file=sys.stderr,
-            )
-
-        print("*** Pass 1: Looking for rare ballot styles.")
-        print()
-        try:
-            index = build_row_index(
-                csv_path, db, args.redact_on_precinct, check_mode=args.check
-            )
-        except (ValueError, OSError) as e:
-            print(f"Error building row index: {e}", file=sys.stderr)
-            sys.exit(1)
-        print()
-
-        needs = check_redaction_needs(
-            index, db, args.min_ballots, args.redact_on_precinct
-        )
-
-        for warning in needs.leakage_warnings:
-            print(f"WARNING: {warning}", file=sys.stderr)
-
-        # Build ballot_types_by_style and named_styles_by_style for display.
-        ballot_types_by_style: Dict[str, Set[str]] = defaultdict(set)
-        for ballot_type, row_indices in index.rows_by_ballot_type.items():
-            for row_idx in row_indices:
-                style = index.style_for_row(row_idx)
-                if style is not None:
-                    ballot_types_by_style[style].add(ballot_type)
-
-        named_styles_by_style: Dict[str, Set[str]] = defaultdict(set)
-        for named_style, row_indices in index.rows_by_named_style.items():
-            for row_idx in row_indices:
-                style = index.style_for_row(row_idx)
-                if style is not None:
-                    named_styles_by_style[style].add(named_style)
-
-        total_styles = len(index.style_strings)
-
-        show_precinct = args.redact_on_precinct and db.precinct_portion_idx is not None
-
-        if needs.rare_privacy_unit_pairs:
-            if show_precinct:
-                total_pairs = len(index.rows_by_privacy_unit)
-                print(
-                    f"  Rare ballot style/precinct combinations "
-                    f"({len(needs.rare_privacy_unit_pairs)} of {total_pairs} total):"
-                )
-            else:
-                print(
-                    f"  Rare ballot styles "
-                    f"({len(needs.rare_privacy_unit_pairs)} of {total_styles} total):"
-                )
-            style_to_id = {}
-            for i, s in enumerate(index.style_strings):
-                style_to_id[s] = i
-
-            for (style, precinct), count in sorted(
-                needs.rare_privacy_unit_pairs.items(), key=lambda item: item[1]
-            ):
-                ballot_types = ballot_types_by_style.get(style, set())
-                named_styles_for_style = named_styles_by_style.get(style, set())
-
-                parts = []
-                if show_precinct:
-                    parts.append(f'precinct "{precinct}"')
-                if ballot_types:
-                    parts.append(
-                        "ballot type: "
-                        + ", ".join(f'"{t}"' for t in sorted(ballot_types))
-                    )
-                elif named_styles_for_style:
-                    parts.append(
-                        "named style: "
-                        + ", ".join(f'"{n}"' for n in sorted(named_styles_for_style))
-                    )
-                parts.append(f"style #{style_to_id[style]}")
-
-                print(f"    {count} ballot(s)  [{', '.join(parts)}]")
-
-        if needs.needs_redaction():
-            print("\nRedaction is needed.")
-        else:
-            print("No redaction needed.")
-
-        if args.check:
-            return
-
-        # Pass 2 and 3.
-        perform_redaction(
-            csv_path,
-            db,
-            index,
-            needs,
-            args.min_ballots,
-            args.output_file,
-            args.redact_on_precinct,
-            args.redacted_list,
-        )
+    if len(sys.argv) > 1:
+        cli_main()
+    else:
+        root = tk.Tk()
+        app = CvrAnonymizerApp(root)
+        root.mainloop()
 
 
 if __name__ == "__main__":
