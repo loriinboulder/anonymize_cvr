@@ -60,6 +60,10 @@ Runs entirely in your browser — no file is uploaded to any server.</p>
         Redact on precinct &mdash; treat rare (style, precinct) combinations as rare styles
     </label>
     <label>
+        <input type="checkbox" id="noContestBalancing">
+        Do not do contest balancing
+    </label>
+    <label>
         Minimum ballots per style:
         <input type="number" id="minBallots" value="10" min="1">
     </label>
@@ -663,6 +667,51 @@ function balanceUnanimity(aggregate, pool, db, log) {
 }
 
 // ============================================================
+// Pass 2 (no contest balancing): collect only the rare rows
+// and build the aggregate from them. No borrowing.
+// Returns: { redactedRowIndices, aggregateRow }
+// ============================================================
+function pass2CollectRareRows(file, db, index, needs, redactOnPrecinct, log) {
+    return new Promise((resolve, reject) => {
+        const rarePuSet = new Set(needs.rarePairs.keys());
+        const rareRows = [];
+        const redactedRowIndices = new Set();
+        let fileRowCount = 0, ballotRowIdx = 0;
+
+        Papa.parse(file, {
+            skipEmptyLines: false,
+            step: function(result) {
+                const row = result.data;
+                fileRowCount++;
+                if (fileRowCount <= 4) return;
+                if (isEmptyRow(row)) return;
+
+                const currentIdx = ballotRowIdx++;
+                if (ballotRowIdx % 100000 === 0)
+                    log('  ' + ballotRowIdx.toLocaleString() + ' rows scanned (pass 2)...');
+
+                const rowStyle = index.styleForRow(currentIdx);
+                if (rowStyle === null) return;
+
+                const precinct = (redactOnPrecinct && db.precinctPortionIdx !== null)
+                    ? (row[db.precinctPortionIdx] || '').trim() : '';
+                const puKey = rowStyle + '|' + precinct;
+
+                if (rarePuSet.has(puKey)) {
+                    rareRows.push(row);
+                    redactedRowIndices.add(currentIdx);
+                }
+            },
+            complete: function() {
+                const aggregateRow = buildAggregateRow(rareRows, db, 'AGGREGATED');
+                resolve({ redactedRowIndices, aggregateRow });
+            },
+            error: reject,
+        });
+    });
+}
+
+// ============================================================
 // Pass 2: stream the file to load rare rows + donors,
 // then build the aggregate in memory.
 // Returns: { redactedRowIndices, aggregateRow }
@@ -939,8 +988,9 @@ document.getElementById('runBtn').addEventListener('click', async function() {
         throw e;
     }
 
-    const minBallots       = parseInt(document.getElementById('minBallots').value) || MIN_BALLOTS_DEFAULT;
-    const redactOnPrecinct = document.getElementById('redactOnPrecinct').checked;
+    const minBallots          = parseInt(document.getElementById('minBallots').value) || MIN_BALLOTS_DEFAULT;
+    const redactOnPrecinct    = document.getElementById('redactOnPrecinct').checked;
+    const noContestBalancing  = document.getElementById('noContestBalancing').checked;
 
     const statusEl = document.getElementById('status');
     statusEl.textContent = '';
@@ -982,8 +1032,13 @@ document.getElementById('runBtn').addEventListener('click', async function() {
         let redactedRowIndices = new Set(), aggregateRow = null;
 
         if (needs.needsRedaction()) {
-            ({ redactedRowIndices, aggregateRow } = await pass2LoadAndBuild(
-                selectedFile, db, index, needs, minBallots, redactOnPrecinct, log));
+            if (noContestBalancing) {
+                ({ redactedRowIndices, aggregateRow } = await pass2CollectRareRows(
+                    selectedFile, db, index, needs, redactOnPrecinct, log));
+            } else {
+                ({ redactedRowIndices, aggregateRow } = await pass2LoadAndBuild(
+                    selectedFile, db, index, needs, minBallots, redactOnPrecinct, log));
+            }
 
             const rareCount = [...needs.rarePairs.keys()].reduce(
                 (s, k) => s + (index.rowsByPrivacyUnit.get(k) || []).length, 0);

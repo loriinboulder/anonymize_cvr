@@ -24,6 +24,7 @@ Terminology used throughout this module:
 import argparse
 import csv
 import io
+import os
 import queue as queue_module
 import sys
 import threading
@@ -1402,6 +1403,55 @@ def load_donor_pool(
     return redacted_row_indices, aggregate_row
 
 
+def collect_rare_rows(
+    csv_path: str,
+    index: RowIndex,
+    needs: RedactionNeeds,
+    db: CvrDatabase,
+    redact_on_precinct: bool,
+) -> Tuple[Set[int], List[str]]:
+    """
+    Pass 2 (no contest balancing): stream the file and collect only the rare rows.
+    Builds the aggregate from those rows alone — no borrowing from common styles.
+    Returns (redacted_row_indices, aggregate_row).
+    """
+    rare_privacy_unit_set: Set[Tuple[str, str]] = set(
+        needs.rare_privacy_unit_pairs.keys()
+    )
+
+    rare_rows: List[List[str]] = []
+    redacted_row_indices: Set[int] = set()
+
+    print("*** Pass 2: Collecting rare ballots (no contest balancing).")
+    print()
+
+    with open(csv_path, "r", encoding="utf-8") as f:
+        reader = csv.reader(f)
+        for _ in range(4):
+            next(reader)
+
+        for row_idx, row in enumerate(row for row in reader if row):
+            if row_idx > 0 and row_idx % 100000 == 0:
+                print(f"  {row_idx:,} rows scanned...", flush=True)
+
+            row_style = index.style_for_row(row_idx)
+            if row_style is None:
+                continue
+
+            if redact_on_precinct and db.precinct_portion_idx is not None:
+                precinct = row[db.precinct_portion_idx].strip()
+            else:
+                precinct = ""
+            privacy_unit = (row_style, precinct)
+
+            if privacy_unit in rare_privacy_unit_set:
+                rare_rows.append(row)
+                redacted_row_indices.add(row_idx)
+
+    aggregate_row = _build_aggregate_row(rare_rows, db, "AGGREGATED")
+    return redacted_row_indices, aggregate_row
+
+
 def _add_to_tally(tally: List[float], row: List[str], headerlen: int) -> None:
     """Add the vote column values from row into tally (in-place)."""
     for i in range(len(tally)):
@@ -1510,12 +1560,16 @@ def perform_redaction(
     output_file: str,
     redact_on_precinct: bool,
     redacted_list_file: Optional[str],
+    no_contest_balancing: bool = False,
 ) -> None:
     """Orchestrate passes 2 and 3 to produce the anonymized CVR."""
     if needs.needs_redaction():
-        result = load_donor_pool(
-            csv_path, index, needs, db, min_ballots, redact_on_precinct
-        )
+        if no_contest_balancing:
+            result = collect_rare_rows(csv_path, index, needs, db, redact_on_precinct)
+        else:
+            result = load_donor_pool(
+                csv_path, index, needs, db, min_ballots, redact_on_precinct
+            )
         redacted_row_indices: Set[int] = result[0]
         aggregate_row: Optional[List[str]] = result[1]
 
@@ -1523,12 +1577,13 @@ def perform_redaction(
         for key, row_indices in index.rows_by_privacy_unit.items():
             if key in needs.rare_privacy_unit_pairs:
                 rare_count += len(row_indices)
-        borrowed_count = len(redacted_row_indices) - rare_count
 
         print("\n*** Pass 2 complete.")
         print(f"  Ballots from rare styles/precincts: {rare_count}")
-        if borrowed_count > 0:
-            print(f"  Ballots borrowed from common styles: {borrowed_count}")
+        if not no_contest_balancing:
+            borrowed_count = len(redacted_row_indices) - rare_count
+            if borrowed_count > 0:
+                print(f"  Ballots borrowed from common styles: {borrowed_count}")
         print(f"  Total ballots in aggregate: {len(redacted_row_indices)}")
     else:
         redacted_row_indices = set()
@@ -1669,6 +1724,7 @@ def execute_redact(
     min_ballots: int,
     redact_on_precinct: bool,
     style_col: Optional[int] = None,
+    no_contest_balancing: bool = False,
 ) -> None:
     """
     Run full redaction: passes 1, 2, and 3.  Writes the anonymized CVR.
@@ -1713,6 +1769,7 @@ def execute_redact(
             output_file,
             redact_on_precinct,
             redacted_list_file,
+            no_contest_balancing,
         )
 
 
@@ -1771,6 +1828,15 @@ def parse_args() -> argparse.Namespace:
         help="Column index (0-based) of the named_style field, if present.",
     )
     parser.add_argument(
+        "--no-contest-balancing",
+        action="store_true",
+        help=(
+            "Do not do contest balancing. Redact only the rare-style ballots "
+            "without borrowing from common styles to satisfy minimums or "
+            "balance near-unanimous contests."
+        ),
+    )
+    parser.add_argument(
         "--redacted-list",
         metavar="FILENAME",
         default=None,
@@ -1809,6 +1875,7 @@ def cli_main() -> None:
             args.min_ballots,
             args.redact_on_precinct,
             args.stylecol,
+            args.no_contest_balancing,
         )
 
 
@@ -1826,6 +1893,7 @@ class CvrAnonymizerApp:
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self.config_redact_on_precinct: bool = False
+        self.config_no_contest_balancing: bool = False
         self.config_min_ballots: int = MIN_BALLOTS_DEFAULT
         self.config_style_col: Optional[int] = None
 
@@ -1892,6 +1960,8 @@ class CvrAnonymizerApp:
         parts = [f"Min ballots: {self.config_min_ballots}"]
         if self.config_redact_on_precinct:
             parts.append("Redact on precinct: yes")
+        if self.config_no_contest_balancing:
+            parts.append("No contest balancing")
         if self.config_style_col is not None:
             parts.append(f"Style column: {self.config_style_col}")
         tk.Label(
@@ -1924,13 +1994,24 @@ class CvrAnonymizerApp:
             frame,
             text=(
                 "Redact on Precinct\n"
-                "    Treat (ballot style, precinct) combinations with fewer than\n"
-                "    the minimum ballots as rare, in addition to rare styles alone."
+                "Treat [ballot style, precinct] combinations with fewer than\n"
+                "the minimum ballots as rare, in addition to rare styles alone."
             ),
             variable=self._redact_on_precinct_var,
             justify=tk.LEFT,
             anchor=tk.W,
         ).pack(anchor=tk.W, pady=(5, 12))
+
+        self._no_contest_balancing_var = tk.BooleanVar(
+            value=self.config_no_contest_balancing
+        )
+        tk.Checkbutton(
+            frame,
+            text="Do not do contest balancing",
+            variable=self._no_contest_balancing_var,
+            justify=tk.LEFT,
+            anchor=tk.W,
+        ).pack(anchor=tk.W, pady=(0, 12))
 
         min_row = tk.Frame(frame)
         min_row.pack(anchor=tk.W, pady=4)
@@ -1997,6 +2078,7 @@ class CvrAnonymizerApp:
             style_col = None
 
         self.config_redact_on_precinct = self._redact_on_precinct_var.get()
+        self.config_no_contest_balancing = self._no_contest_balancing_var.get()
         self.config_min_ballots = min_b
         self.config_style_col = style_col
         self._show_main_menu()
@@ -2030,7 +2112,7 @@ class CvrAnonymizerApp:
             "Output CVR File:",
             self._redact_output_var,
             lambda: self._browse_save(
-                self._redact_output_var, "Save redacted CVR as", "*.csv"
+                self._redact_output_var, "Save redacted CVR as", ".csv"
             ),
         )
         self._add_file_row(
@@ -2038,7 +2120,7 @@ class CvrAnonymizerApp:
             "Redacted Ballot List\n(optional):",
             self._redact_list_var,
             lambda: self._browse_save(
-                self._redact_list_var, "Save redacted ballot list as", "*.txt"
+                self._redact_list_var, "Save redacted ballot list as", ".txt"
             ),
         )
 
@@ -2073,6 +2155,7 @@ class CvrAnonymizerApp:
             self.config_min_ballots,
             self.config_redact_on_precinct,
             self.config_style_col,
+            self.config_no_contest_balancing,
         )
 
     # ------------------------------------------------------------------
@@ -2175,16 +2258,22 @@ class CvrAnonymizerApp:
             var.set(path)
 
     def _browse_save(self, var: tk.StringVar, title: str, default_ext: str) -> None:
-        path = filedialog.asksaveasfilename(
-            title=title,
-            filetypes=[
+        if default_ext == ".txt":
+            filetypes = [("Text files", "*.txt"), ("All files", "*.*")]
+        else:
+            filetypes = [
                 ("CSV files", "*.csv"),
                 ("Text files", "*.txt"),
                 ("All files", "*.*"),
-            ],
+            ]
+        path = filedialog.asksaveasfilename(
+            title=title,
+            filetypes=filetypes,
             defaultextension=default_ext,
         )
         if path:
+            if not path.lower().endswith(default_ext.lower()):
+                path = path + default_ext
             var.set(path)
 
     def _append_status(self, text: str) -> None:
