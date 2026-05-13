@@ -2,7 +2,8 @@
     test-no-redaction test-needs-borrowing test-rare-unique-contest \
     test-near-unanimous-fixable test-near-unanimous-unavoidable \
     test-precinct-redaction test-ballot-type-present test-named-style \
-    test-no-balancing-skips-borrowing test-no-balancing-near-unanimous
+    test-no-balancing-skips-borrowing test-no-balancing-near-unanimous \
+    test-blocked-style
 
 GENERATED = testCases/generated
 OUTPUT = /tmp/anonymize_test_outputs
@@ -17,7 +18,8 @@ test: generate \
     test-ballot-type-present \
     test-named-style \
     test-no-balancing-skips-borrowing \
-    test-no-balancing-near-unanimous
+    test-no-balancing-near-unanimous \
+    test-blocked-style
 
 generate:
 	python generate_test_cvrs.py
@@ -127,6 +129,17 @@ test-no-balancing-near-unanimous:
 	python verify_redaction.py \
 	    $(GENERATED)/near_unanimous_fixable.csv \
 	    $(OUTPUT)/no_balancing_near_unanimous.csv
+
+test-blocked-style:
+	mkdir -p $(OUTPUT)
+	python anonymize_cvr.py \
+	    $(GENERATED)/blocked_style.csv \
+	    $(OUTPUT)/blocked_style.csv
+	python anonymize_cvr.py --check \
+	    $(OUTPUT)/blocked_style.csv
+	python verify_redaction.py \
+	    $(GENERATED)/blocked_style.csv \
+	    $(OUTPUT)/blocked_style.csv
 
 clean:
 	rm -f $(OUTPUT)/*.csv

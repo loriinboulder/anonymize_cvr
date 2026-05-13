@@ -223,6 +223,18 @@ def _make_test_cases() -> List[TestCase]:
             ],
             unexpected=["Traceback", "Borrowed", "WARNING"],
         ),
+        TestCase(
+            name="blocked_style",
+            input_file=f"{g}/blocked_style.csv",
+            output_file=f"{o}/blocked_style.csv",
+            expected=[
+                "Tally verification passed.",
+            ],
+            unexpected=[
+                "Traceback",
+                "WARNING: could not find enough ballots",
+            ],
+        ),
     ]
 
 

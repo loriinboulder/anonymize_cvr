@@ -503,6 +503,64 @@ def _scenario_named_style() -> Scenario:
     )
 
 
+def _scenario_blocked_style() -> Scenario:
+    """
+    LocalMeasure contest appears on a rare style (4 ballots) and one common style.
+    The common style with LocalMeasure has exactly min_ballots=10 rows (blocked):
+    borrowing any single ballot would leave that style with < 10.  Regular borrowing
+    fills President and Senate from a different common style, then stalls on
+    LocalMeasure.  pull_blocked_style_for() must pull the entire blocked style into
+    the aggregate to satisfy the LocalMeasure minimum.
+    Expected: no WARNING, tally passes, aggregate includes all three style groups.
+    Command: python anonymize_cvr.py testCases/generated/blocked_style.csv /tmp/out.csv
+    """
+    contests = [
+        Contest("President", ["Alice", "Bob"]),
+        Contest("Senate", ["Carol", "Dave"]),
+        Contest("LocalMeasure", ["Yes", "No"]),
+    ]
+    ballots = [
+        # Rare style: President + Senate + LocalMeasure (style "111"), 4 ballots.
+        BallotSpec(
+            ["President", "Senate", "LocalMeasure"],
+            {"President": "Alice", "Senate": "Carol", "LocalMeasure": "Yes"},
+            count=4,
+        ),
+        # Common style A: President + Senate only (style "110"), 20 ballots.
+        # Covers President and Senate but not LocalMeasure.
+        BallotSpec(
+            ["President", "Senate"],
+            {"President": "Alice", "Senate": "Carol"},
+            count=10,
+        ),
+        BallotSpec(
+            ["President", "Senate"],
+            {"President": "Bob", "Senate": "Dave"},
+            count=10,
+        ),
+        # Blocked style: President + LocalMeasure (style "101"), exactly 10 ballots.
+        # Can't donate individual ballots without violating Rule d.
+        # pull_blocked_style_for() must pull all 10 into the aggregate.
+        BallotSpec(
+            ["President", "LocalMeasure"],
+            {"President": "Alice", "LocalMeasure": "Yes"},
+            count=5,
+        ),
+        BallotSpec(
+            ["President", "LocalMeasure"],
+            {"President": "Bob", "LocalMeasure": "No"},
+            count=5,
+        ),
+    ]
+    return Scenario(
+        filename="blocked_style.csv",
+        description="LocalMeasure only on rare style + blocked style (10 ballots). Blocked style pulled whole.",
+        election_name="Test: Blocked Style",
+        all_contests=contests,
+        ballots=ballots,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -518,6 +576,7 @@ def main() -> None:
         _scenario_precinct_redaction(),
         _scenario_ballot_type_present(),
         _scenario_named_style(),
+        _scenario_blocked_style(),
     ]
 
     print(f"Writing test CVR files to {OUTPUT_DIR}/")

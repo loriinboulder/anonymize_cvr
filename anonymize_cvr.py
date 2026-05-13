@@ -33,6 +33,8 @@ from tkinter import filedialog, messagebox
 from collections import defaultdict
 from typing import Dict, List, Optional, Set, Tuple
 
+VERSION = "0.2"
+
 MIN_BALLOTS_DEFAULT = 10
 NEAR_UNANIMOUS_THRESHOLD = 2  # "all but N votes" triggers balancing (Rule c)
 MIN_CONTRASTING_VOTES = 3  # contrasting votes needed per contest after balancing
@@ -654,6 +656,7 @@ class CommonPool:
         styles: Dict[Tuple[str, str], List[List[str]]],
         min_ballots: int,
         rowcount_by_privacy_unit: Dict[Tuple[str, str], int],
+        blocked_styles: Optional[Dict[Tuple[str, str], List[List[str]]]] = None,
     ) -> None:
         self._styles: Dict[Tuple[str, str], List[List[str]]] = {
             key: list(rows) for key, rows in styles.items()
@@ -661,6 +664,10 @@ class CommonPool:
         self.min_ballots = min_ballots
         self._rowcount_by_privacy_unit = rowcount_by_privacy_unit
         self._removed_counts: Dict[Tuple[str, str], int] = {}
+        self._blocked_styles: Dict[Tuple[str, str], List[List[str]]] = {}
+        if blocked_styles is not None:
+            for key, rows in blocked_styles.items():
+                self._blocked_styles[key] = list(rows)
 
     def _surplus(self, key: Tuple[str, str]) -> int:
         """
@@ -791,6 +798,46 @@ class CommonPool:
                 continue
             return (best_key, idx, row)
         return None
+
+    def pull_blocked_style_for(
+        self,
+        needed_contests: Dict[str, int],
+        db: CvrDatabase,
+    ) -> Optional[Tuple[Tuple[str, str], List[List[str]]]]:
+        """
+        Find the blocked style (at exactly min_ballots rows in the full CVR) that
+        covers the most contests still needing ballots, pull all its rows, and return
+        (key, rows).  Returns None if no blocked style covers any needed contest.
+
+        A blocked style can't donate individual ballots without violating Rule d, but
+        pulling the entire style into the aggregate is safe: all its voters become
+        part of the aggregate, and none are left as an identifiable minority.
+        """
+        needed_list = []
+        for contest, n in needed_contests.items():
+            if n > 0:
+                needed_list.append(contest)
+        if not needed_list:
+            return None
+
+        best_key = None
+        best_coverage = 0
+
+        for key, rows in self._blocked_styles.items():
+            coverage = 0
+            for contest in needed_list:
+                for row in rows:
+                    if _ballot_has_contest(row, contest, db.contest_to_columns):
+                        coverage += 1
+                        break  # count each needed contest at most once
+            if coverage > best_coverage:
+                best_coverage = coverage
+                best_key = key
+
+        if best_key is None:
+            return None
+        rows = self._blocked_styles.pop(best_key)
+        return (best_key, rows)
 
 
 # ---------------------------------------------------------------------------
@@ -1008,11 +1055,19 @@ def build_aggregate(
     while not aggregate.satisfies_minimums():
         result = pool.best_candidate_for(aggregate, db)
         if result is None:
+            blocked = pool.pull_blocked_style_for(
+                aggregate.contests_needing_ballots(), db
+            )
+            if blocked is not None:
+                _, blocked_rows = blocked
+                for ballot in blocked_rows:
+                    aggregate.add(ballot)
+                continue
             for contest, needed in aggregate.contests_needing_ballots().items():
                 print(
                     f"WARNING: could not find enough ballots for contest "
                     f"'{contest}' (still need {needed} more). "
-                    f"This contest may only appear on rare ballot styles.",
+                    f"This contest only appears on rare ballot styles.",
                     file=sys.stderr,
                 )
             break
@@ -1237,6 +1292,7 @@ def load_donor_pool(
 
     rare_rows: List[List[str]] = []
     donor_by_privacy_unit: Dict[Tuple[str, str], List[List[str]]] = defaultdict(list)
+    blocked_by_privacy_unit: Dict[Tuple[str, str], List[List[str]]] = defaultdict(list)
 
     # Maps id(row) to row_idx for all loaded rows, used to identify aggregated rows.
     row_to_idx: Dict[int, int] = {}
@@ -1268,6 +1324,21 @@ def load_donor_pool(
             else:
                 privacy_unit_count = rowcount_by_privacy_unit.get(privacy_unit, 0)
                 if privacy_unit_count <= min_ballots:
+                    if privacy_unit_count == min_ballots:
+                        # Blocked style: at exactly min_ballots, can't donate
+                        # individual ballots without violating Rule d.  Track for
+                        # potential whole-style pull if individual borrowing stalls.
+                        style_has_rare_contest = False
+                        for i, contest_name in enumerate(db.contest_names):
+                            if (
+                                contest_name in rare_ballot_contests
+                                and row_style[i] == "1"
+                            ):
+                                style_has_rare_contest = True
+                                break
+                        if style_has_rare_contest:
+                            blocked_by_privacy_unit[privacy_unit].append(row)
+                            row_to_idx[id(row)] = row_idx
                     continue
 
                 # Find which rare-ballot contests are present on this row.
@@ -1348,7 +1419,10 @@ def load_donor_pool(
                             break
 
     pool = CommonPool(
-        dict(donor_by_privacy_unit), min_ballots, rowcount_by_privacy_unit
+        dict(donor_by_privacy_unit),
+        min_ballots,
+        rowcount_by_privacy_unit,
+        dict(blocked_by_privacy_unit),
     )
 
     aggregate = build_aggregate(rare_rows, rare_ballot_contests, pool, db, min_ballots)
@@ -1787,6 +1861,11 @@ def parse_args() -> argparse.Namespace:
         )
     )
     parser.add_argument(
+        "--version",
+        action="version",
+        version=f"anonymize_cvr {VERSION}",
+    )
+    parser.add_argument(
         "input_file",
         help="Path to the input CVR file (CSV format).",
     )
@@ -1925,6 +2004,13 @@ class CvrAnonymizerApp:
         tk.Label(
             self.root,
             text="Anonymize Cast Vote Records per Colorado C.R.S. 24-72-205.5",
+            font=("TkDefaultFont", 9),
+            fg="gray",
+        ).pack(pady=(0, 2))
+
+        tk.Label(
+            self.root,
+            text=f"Version {VERSION}",
             font=("TkDefaultFont", 9),
             fg="gray",
         ).pack(pady=(0, 15))
