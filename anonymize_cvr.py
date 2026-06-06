@@ -356,7 +356,9 @@ def build_row_index(
         for _ in range(4):
             next(reader)
 
-        for row_idx, row in enumerate(row for row in reader if row):
+        for row_idx, row in enumerate(
+            row for row in reader if any(v.strip() for v in row)
+        ):
             if row_idx > 0 and row_idx % 100000 == 0:
                 print(f"  {row_idx:,} rows scanned...", flush=True)
             if len(row) != expected_cols:
@@ -370,6 +372,11 @@ def build_row_index(
                         "input file contains already-redacted rows; "
                         "cannot re-redact a previously anonymized file."
                     )
+                index.style_id_for_row.append(None)
+                continue
+            # County pre-redacted rows: all vote columns blank.  Nothing to analyse or
+            # anonymize; pass through unchanged in both check and redact modes.
+            if all(row[i].strip() == "" for i in range(db.headerlen, len(row))):
                 index.style_id_for_row.append(None)
                 continue
 
@@ -1305,7 +1312,9 @@ def load_donor_pool(
         for _ in range(4):
             next(reader)
 
-        for row_idx, row in enumerate(row for row in reader if row):
+        for row_idx, row in enumerate(
+            row for row in reader if any(v.strip() for v in row)
+        ):
             if row_idx > 0 and row_idx % 100000 == 0:
                 print(f"  {row_idx:,} rows scanned...", flush=True)
             row_style = index.style_for_row(row_idx)
@@ -1504,7 +1513,9 @@ def collect_rare_rows(
         for _ in range(4):
             next(reader)
 
-        for row_idx, row in enumerate(row for row in reader if row):
+        for row_idx, row in enumerate(
+            row for row in reader if any(v.strip() for v in row)
+        ):
             if row_idx > 0 and row_idx % 100000 == 0:
                 print(f"  {row_idx:,} rows scanned...", flush=True)
 
@@ -1585,7 +1596,9 @@ def _stream_redacted_output(
                 for _ in range(4):
                     writer.writerow(_remove_columns(next(reader), cols_to_remove))
 
-                for row_idx, row in enumerate(r for r in reader if r):
+                for row_idx, row in enumerate(
+                    r for r in reader if any(v.strip() for v in r)
+                ):
                     if row_idx > 0 and row_idx % 100000 == 0:
                         print(f"  {row_idx:,} rows written...", flush=True)
                     _add_to_tally(pre_tally, row, db.headerlen)
