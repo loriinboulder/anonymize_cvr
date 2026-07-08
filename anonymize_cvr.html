@@ -92,7 +92,7 @@ const DONOR_SURPLUS_THRESHOLD = 3;
 // ============================================================
 
 function isEmptyRow(row) {
-    return row.length <= 1 && (row[0] || '').trim() === '';
+    return !row.some(v => (v || '').trim() !== '');
 }
 
 // Serialize one row to a CSV line (no trailing newline).
@@ -278,6 +278,12 @@ function pass1BuildDbAndIndex(file, redactOnPrecinct, log) {
                     styleIdForRow.push(null);
                     return;
                 }
+                // County pre-redacted rows: all vote columns blank.  Nothing to
+                // analyse or anonymize; pass through unchanged.
+                if (row.slice(db.headerlen).every(v => (v || '').trim() === '')) {
+                    styleIdForRow.push(null);
+                    return;
+                }
 
                 const styleStr = computeStyle(row, db);
                 if (!(styleStr in styleTable)) {
@@ -408,11 +414,12 @@ class Aggregate {
 // CommonPool — donor ballots available for borrowing (Rule d)
 // ============================================================
 class CommonPool {
-    constructor(donors, minBallots, rowcountByPu) {
+    constructor(donors, minBallots, rowcountByPu, blockedStyles) {
         this.donors        = new Map(donors);
         this.minBallots    = minBallots;
         this.rowcountByPu  = rowcountByPu;
         this.removedCounts = new Map();
+        this.blockedStyles = new Map(blockedStyles || []);
     }
 
     surplus(key) {
@@ -482,6 +489,33 @@ class CommonPool {
             if (!aggregate.containsRow(rowIdx)) return { key: bestKey, idx, rowIdx, row };
         }
         return null;
+    }
+
+    // Find the blocked style (at exactly minBallots rows in the full CVR) that
+    // covers the most contests still needing ballots, pull all its rows, and
+    // return { key, rows }.  Returns null if no blocked style covers any needed
+    // contest.
+    //
+    // A blocked style can't donate individual ballots without violating Rule d,
+    // but pulling the entire style into the aggregate is safe: all its voters
+    // become part of the aggregate, and none are left as an identifiable minority.
+    pullBlockedStyleFor(neededContests, db) {
+        const neededList = Object.keys(neededContests).filter(c => neededContests[c] > 0);
+        if (neededList.length === 0) return null;
+
+        let bestKey = null, bestCoverage = 0;
+        for (const [key, rows] of this.blockedStyles) {
+            let coverage = 0;
+            for (const contest of neededList) {
+                if (rows.some(({ row }) => ballotHasContest(row, contest, db.contestToColumns)))
+                    coverage++;
+            }
+            if (coverage > bestCoverage) { bestCoverage = coverage; bestKey = key; }
+        }
+        if (bestKey === null) return null;
+        const rows = this.blockedStyles.get(bestKey);
+        this.blockedStyles.delete(bestKey);
+        return { key: bestKey, rows };
     }
 }
 
@@ -578,6 +612,11 @@ function buildAggregate(rareBallots, rareContests, pool, db, minBallots, log) {
     while (!aggregate.satisfiesMinimums()) {
         const result = pool.bestCandidateFor(aggregate, db);
         if (result === null) {
+            const blocked = pool.pullBlockedStyleFor(aggregate.contestsNeedingBallots(), db);
+            if (blocked !== null) {
+                for (const { rowIdx, row } of blocked.rows) aggregate.add(rowIdx, row);
+                continue;
+            }
             for (const [contest, n] of Object.entries(aggregate.contestsNeedingBallots()))
                 log("WARNING: could not find enough ballots for contest '" + contest +
                     "' (still need " + n + " more).");
@@ -747,7 +786,7 @@ function pass2LoadAndBuild(file, db, index, needs, minBallots, redactOnPrecinct,
 
     return new Promise((resolve, reject) => {
         const donorCountByContest = {}, donorVotedTally = {};
-        const rareRows = [], donorByPu = new Map();
+        const rareRows = [], donorByPu = new Map(), blockedByPu = new Map();
         let fileRowCount = 0, ballotRowIdx = 0;
 
         Papa.parse(file, {
@@ -773,7 +812,24 @@ function pass2LoadAndBuild(file, db, index, needs, minBallots, redactOnPrecinct,
                 }
 
                 const puCount = rowcountByPu.get(puKey) || 0;
-                if (puCount <= minBallots) return;
+                if (puCount <= minBallots) {
+                    if (puCount === minBallots) {
+                        // Blocked style: at exactly minBallots, can't donate
+                        // individual ballots without violating Rule d.  Track for
+                        // potential whole-style pull if individual borrowing stalls.
+                        let styleHasRareContest = false;
+                        for (let i = 0; i < db.contestNames.length; i++)
+                            if (rareBallotContests.has(db.contestNames[i]) && rowStyle[i] === '1') {
+                                styleHasRareContest = true;
+                                break;
+                            }
+                        if (styleHasRareContest) {
+                            if (!blockedByPu.has(puKey)) blockedByPu.set(puKey, []);
+                            blockedByPu.get(puKey).push({ rowIdx: currentIdx, row });
+                        }
+                    }
+                    return;
+                }
 
                 const rowRareContests = [];
                 for (const cn of rareBallotContests)
@@ -819,7 +875,7 @@ function pass2LoadAndBuild(file, db, index, needs, minBallots, redactOnPrecinct,
                 }
             },
             complete: function() {
-                const pool      = new CommonPool(donorByPu, minBallots, rowcountByPu);
+                const pool      = new CommonPool(donorByPu, minBallots, rowcountByPu, blockedByPu);
                 const aggregate = buildAggregate(rareRows, rareBallotContests, pool, db, minBallots, log);
 
                 const borrowedAfterAb = aggregate.totalCount() - rareRows.length;
@@ -907,7 +963,9 @@ async function pass3WriteToFile(file, db, headerRows, redactedRowIndices,
             fileLineCount++;
             if (fileLineCount <= 4) continue;   // header lines already written
 
-            const row        = parseCsvRow(line);
+            const row = parseCsvRow(line);
+            if (isEmptyRow(row)) continue;   // county pre-redacted/EOF artifact rows
+
             const currentIdx = ballotRowIdx++;
             if (ballotRowIdx % 100000 === 0)
                 log('  ' + ballotRowIdx.toLocaleString() + ' rows written (pass 3)...');
@@ -927,11 +985,13 @@ async function pass3WriteToFile(file, db, headerRows, redactedRowIndices,
 
     // Handle any remaining content (last line with no trailing newline).
     if (lineBuffer.trim() !== '') {
-        const row        = parseCsvRow(lineBuffer);
-        const currentIdx = ballotRowIdx++;
-        addToTally(preTally, row, db.headerlen);
-        writeLine(blankGeographicFields(row, db, redactOnPrecinct));
-        addToTally(postTally, row, db.headerlen);
+        const row = parseCsvRow(lineBuffer);
+        if (!isEmptyRow(row)) {
+            const currentIdx = ballotRowIdx++;
+            addToTally(preTally, row, db.headerlen);
+            writeLine(blankGeographicFields(row, db, redactOnPrecinct));
+            addToTally(postTally, row, db.headerlen);
+        }
     }
 
     // Append the aggregate row and verify tallies.
