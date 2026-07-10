@@ -936,7 +936,7 @@ async function pass3WriteToFile(file, db, headerRows, redactedRowIndices,
         if (buf.length > 0) { await writable.write(buf.join('')); buf.length = 0; }
     }
     function writeLine(row) {
-        buf.push(serializeRow(removeColumns(row, colsToRemove)) + '\n');
+        buf.push(serializeRow(removeColumns(row, colsToRemove)) + '\r\n');
     }
 
     // Write the four header rows (already in memory from Pass 1).
