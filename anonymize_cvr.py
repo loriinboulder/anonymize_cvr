@@ -1672,23 +1672,20 @@ def perform_redaction(
             if borrowed_count > 0:
                 print(f"  Ballots borrowed from common styles: {borrowed_count}")
         print(f"  Total ballots in aggregate: {len(redacted_row_indices)}")
-    else:
-        redacted_row_indices = set()
-        aggregate_row = None
 
-    print("\n*** Pass 3: Writing output.")
-    _stream_redacted_output(
-        csv_path,
-        db,
-        output_file,
-        redacted_row_indices,
-        aggregate_row,
-        redact_on_precinct,
-        redacted_list_file,
-    )
-    print(f"  Output written to {output_file}.")
-    if redacted_list_file is not None:
-        print(f"  Redacted ballot list written to {redacted_list_file}.")
+        print("\n*** Pass 3: Writing output.")
+        _stream_redacted_output(
+            csv_path,
+            db,
+            output_file,
+            redacted_row_indices,
+            aggregate_row,
+            redact_on_precinct,
+            redacted_list_file,
+        )
+        print(f"  Output written to {output_file}.")
+        if redacted_list_file is not None:
+            print(f"  Redacted ballot list written to {redacted_list_file}.")
 
 
 # ---------------------------------------------------------------------------
