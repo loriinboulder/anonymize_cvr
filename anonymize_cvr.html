@@ -1975,7 +1975,7 @@ Runs entirely in your browser — no file is uploaded to any server.</p>
     </label>
     <label>
         <input type="checkbox" id="noContestBalancing">
-        Do not do contest balancing
+        Skip contest balancing (still meets total ballot minimum)
     </label>
     <label>
         Minimum ballots per style:
@@ -2620,15 +2620,43 @@ function balanceUnanimity(aggregate, pool, db, log) {
 }
 
 // ============================================================
-// Pass 2 (no contest balancing): collect only the rare rows
-// and build the aggregate from them. No borrowing.
+// Pass 2 (no contest balancing): collect the rare rows and borrow the
+// minimum number of common-style ballots needed to satisfy the mandatory
+// floor of minBallots total ballots (Rule a, the C.R.S. 24-72-205.5
+// requirement).  Unlike the full path this deliberately skips the optional
+// balancing: no per-contest minimum (Rule b) and no near-unanimity balancing
+// (Rule c).  Borrowing to the floor is achieved by building the Aggregate with
+// an empty rareContests set, so satisfiesMinimums() reduces to Rule a alone and
+// the borrow loop pulls generic surplus ballots rather than contest-targeted
+// ones.
 // Returns: { redactedRowIndices, aggregateRow }
 // ============================================================
-function pass2CollectRareRows(file, db, index, needs, redactOnPrecinct, log) {
+function pass2CollectRareRows(file, db, index, needs, redactOnPrecinct, minBallots, log) {
+    // Full-dataset row counts per privacy unit (from pass 1), used both to size
+    // the borrowing need and for CommonPool's Rule d enforcement.
+    const rowcountByPu = new Map();
+    for (const [puKey, rowIndices] of index.rowsByPrivacyUnit)
+        rowcountByPu.set(puKey, rowIndices.length);
+    let rareTotal = 0;
+    for (const puKey of needs.rarePairs.keys())
+        rareTotal += rowcountByPu.get(puKey) || 0;
+    // How many common ballots we must borrow to reach the floor.
+    const gap = Math.max(0, minBallots - rareTotal);
+    // At most a couple of blocked styles are ever needed as a fallback; one
+    // holds minBallots ballots, always enough to cross the floor.
+    const maxBlockedKeys = gap > 0 ? Math.floor(gap / minBallots) + 2 : 0;
+
     return new Promise((resolve, reject) => {
-        const rarePuSet = new Set(needs.rarePairs.keys());
         const rareRows = [];
-        const redactedRowIndices = new Set();
+        const donorByPu = new Map();
+        // Blocked styles (exactly minBallots ballots) can't donate individuals
+        // without violating Rule d, but the whole style can be pulled at once as
+        // a fallback when no surplus donors exist.
+        const blockedByPu = new Map();
+        // Count of genuinely-donatable rows loaded.  Each pair is drawn from
+        // only up to its own Rule-d surplus (full_count - minBallots), so this
+        // is never inflated by loading extra rows from a low-surplus pair.
+        let loadedSurplus = 0;
         let fileRowCount = 0, ballotRowIdx = 0;
 
         Papa.parse(file, {
@@ -2650,14 +2678,72 @@ function pass2CollectRareRows(file, db, index, needs, redactOnPrecinct, log) {
                     ? (row[db.precinctPortionIdx] || '').trim() : '';
                 const puKey = rowStyle + '|' + precinct;
 
-                if (rarePuSet.has(puKey)) {
-                    rareRows.push(row);
-                    redactedRowIndices.add(currentIdx);
+                if (needs.rarePairs.has(puKey)) {
+                    rareRows.push({ rowIdx: currentIdx, row });
+                } else if (gap > 0) {
+                    const puCount = rowcountByPu.get(puKey) || 0;
+                    const pairSurplus = puCount - minBallots;
+                    const loadedFromPair = donorByPu.has(puKey) ? donorByPu.get(puKey).length : 0;
+                    if (pairSurplus > 0 && loadedSurplus < gap && loadedFromPair < pairSurplus) {
+                        // Generic donor from a common unit with surplus above the
+                        // floor (Rule d safe).  No contest targeting needed since
+                        // we only aim to reach the total-ballot floor.  Never load
+                        // more from a pair than it can actually spare.
+                        if (!donorByPu.has(puKey)) donorByPu.set(puKey, []);
+                        donorByPu.get(puKey).push({ rowIdx: currentIdx, row });
+                        loadedSurplus++;
+                    } else if (puCount === minBallots &&
+                               (blockedByPu.has(puKey) || blockedByPu.size < maxBlockedKeys)) {
+                        // Reserve a whole blocked style as fallback (all its rows).
+                        if (!blockedByPu.has(puKey)) blockedByPu.set(puKey, []);
+                        blockedByPu.get(puKey).push({ rowIdx: currentIdx, row });
+                    }
                 }
             },
             complete: function() {
-                const aggregateRow = buildAggregateRow(rareRows, db, 'AGGREGATED');
-                resolve({ redactedRowIndices, aggregateRow });
+                if (gap === 0) {
+                    // Rare ballots already meet the floor; no borrowing.
+                    resolve({
+                        redactedRowIndices: new Set(rareRows.map(b => b.rowIdx)),
+                        aggregateRow: buildAggregateRow(rareRows.map(b => b.row), db, 'AGGREGATED'),
+                    });
+                    return;
+                }
+
+                // Borrow to the floor.  Empty rareContests => Rule a only (no b, no c).
+                log('  Rare ballots: ' + rareRows.length +
+                    '.  Borrowing common ballots to reach the ' + minBallots + '-ballot minimum');
+                log('  (per-contest and near-unanimity balancing intentionally skipped).');
+                const pool = new CommonPool(donorByPu, minBallots, rowcountByPu);
+                const aggregate = new Aggregate(rareRows, new Set(), db, minBallots);
+                while (aggregate.needsMoreTotalBallots()) {
+                    const result = pool.bestCandidateFor(aggregate, db);
+                    if (result !== null) {
+                        aggregate.add(result.rowIdx, result.row);
+                        pool.remove(result.key, result.idx);
+                        continue;
+                    }
+                    // Individual borrowing stalled (no surplus donors left).  Pull
+                    // a whole blocked style -- all its ballots leave the dataset
+                    // together, which is Rule d safe -- as a last resort.
+                    if (blockedByPu.size > 0) {
+                        const [bKey, bRows] = blockedByPu.entries().next().value;
+                        blockedByPu.delete(bKey);
+                        for (const b of bRows) aggregate.add(b.rowIdx, b.row);
+                        continue;
+                    }
+                    break;
+                }
+
+                if (aggregate.totalCount() < minBallots)
+                    log('WARNING: could only assemble ' + aggregate.totalCount() +
+                        ' ballots for the aggregate (minimum ' + minBallots +
+                        '). Not enough surplus common ballots exist county-wide to reach the floor.');
+
+                resolve({
+                    redactedRowIndices: new Set(aggregate.ballots.map(b => b.rowIdx)),
+                    aggregateRow: buildAggregateRow(aggregate.ballots.map(b => b.row), db, 'AGGREGATED'),
+                });
             },
             error: reject,
         });
@@ -3011,7 +3097,7 @@ document.getElementById('runBtn').addEventListener('click', async function() {
             let redactedRowIndices, aggregateRow;
             if (noContestBalancing) {
                 ({ redactedRowIndices, aggregateRow } = await pass2CollectRareRows(
-                    selectedFile, db, index, needs, redactOnPrecinct, log));
+                    selectedFile, db, index, needs, redactOnPrecinct, minBallots, log));
             } else {
                 ({ redactedRowIndices, aggregateRow } = await pass2LoadAndBuild(
                     selectedFile, db, index, needs, minBallots, redactOnPrecinct, log));
